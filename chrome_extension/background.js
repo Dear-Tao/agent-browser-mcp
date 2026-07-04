@@ -12,16 +12,46 @@ const TMWD_DEFAULT_PORT =
     : typeof TMWD_PORT === 'string' && /^\d+$/.test(TMWD_PORT)
       ? Math.max(1, Math.min(65535, parseInt(TMWD_PORT, 10)))
       : 18865;
+const TMWD_DEFAULT_SECURE =
+  typeof TMWD_SECURE === 'boolean' ? TMWD_SECURE : false;
+const TMWD_DEFAULT_SKIP_HTTP =
+  typeof TMWD_SKIP_HTTP_PROBE === 'boolean'
+    ? TMWD_SKIP_HTTP_PROBE
+    : TMWD_DEFAULT_SECURE;
+const TMWD_DEFAULT_WS_URL =
+  typeof TMWD_WS_URL === 'string' ? TMWD_WS_URL.trim() : '';
 const TMWD_STORAGE_HOST = 'tmwd_bridge_host';
 const TMWD_STORAGE_PORT = 'tmwd_bridge_port';
+const TMWD_STORAGE_SECURE = 'tmwd_bridge_secure';
+
+function tmwdParseWsUrl(input) {
+  const raw = String(input || '').trim();
+  if (!/^wss?:\/\//i.test(raw)) return null;
+  try {
+    const u = new URL(raw);
+    if (!u.hostname) return null;
+    const secure = u.protocol === 'wss:';
+    const port = u.port
+      ? parseInt(u.port, 10)
+      : secure
+        ? 443
+        : 80;
+    if (!Number.isFinite(port) || port < 1 || port > 65535) return null;
+    return { host: u.hostname, port, secure, wsUrl: raw };
+  } catch (_) {
+    return null;
+  }
+}
 
 function tmwdBracketHost(h) {
   if (!h || h.startsWith('[')) return h;
   return h.split(':').length > 2 ? `[${h}]` : h;
 }
 
-function tmwdBridgeWsUrl(host, port) {
-  return `ws://${tmwdBracketHost(host)}:${port}`;
+function tmwdBridgeWsUrl(ep) {
+  if (ep.wsUrl) return ep.wsUrl;
+  const scheme = ep.secure ? 'wss' : 'ws';
+  return `${scheme}://${tmwdBracketHost(ep.host)}:${ep.port}`;
 }
 
 function tmwdBridgeHttpUrl(host, port) {
@@ -29,17 +59,41 @@ function tmwdBridgeHttpUrl(host, port) {
 }
 
 async function loadBridgeEndpoint() {
-  const stored = await chrome.storage.local.get([TMWD_STORAGE_HOST, TMWD_STORAGE_PORT]);
-  let host = typeof stored[TMWD_STORAGE_HOST] === 'string' ? stored[TMWD_STORAGE_HOST].trim() : '';
+  const stored = await chrome.storage.local.get([
+    TMWD_STORAGE_HOST,
+    TMWD_STORAGE_PORT,
+    TMWD_STORAGE_SECURE,
+  ]);
+  let host =
+    typeof stored[TMWD_STORAGE_HOST] === 'string'
+      ? stored[TMWD_STORAGE_HOST].trim()
+      : '';
   if (!host) host = TMWD_DEFAULT_HOST;
+
   let port = stored[TMWD_STORAGE_PORT];
-  if (port === undefined || port === null || port === '') {
+  const hasStoredPort = port !== undefined && port !== null && port !== '';
+  if (!hasStoredPort) {
     port = TMWD_DEFAULT_PORT;
   } else {
     const n = parseInt(String(port), 10);
     port = Number.isFinite(n) && n >= 1 && n <= 65535 ? n : TMWD_DEFAULT_PORT;
   }
-  return { host, port };
+
+  let secure = stored[TMWD_STORAGE_SECURE];
+  if (secure === undefined || secure === null) secure = TMWD_DEFAULT_SECURE;
+  else secure = !!secure;
+
+  let wsUrl = TMWD_DEFAULT_WS_URL || null;
+  const parsed = tmwdParseWsUrl(host);
+  if (parsed) {
+    host = parsed.host;
+    if (!hasStoredPort) port = parsed.port;
+    secure = parsed.secure;
+    wsUrl = parsed.wsUrl;
+  }
+
+  const skipHttpProbe = TMWD_DEFAULT_SKIP_HTTP || secure;
+  return { host, port, secure, skipHttpProbe, wsUrl };
 }
 
 let ws = null;
@@ -191,14 +245,24 @@ async function cdpFileChooserFill(msg) {
 
 async function handleExtMessage(msg, sender) {
   if (msg.cmd === 'tmwd_bridge_get') {
-    const stored = await chrome.storage.local.get([TMWD_STORAGE_HOST, TMWD_STORAGE_PORT]);
+    const stored = await chrome.storage.local.get([
+      TMWD_STORAGE_HOST,
+      TMWD_STORAGE_PORT,
+      TMWD_STORAGE_SECURE,
+    ]);
     const effective = await loadBridgeEndpoint();
     return {
       ok: true,
-      defaults: { host: TMWD_DEFAULT_HOST, port: TMWD_DEFAULT_PORT },
+      defaults: {
+        host: TMWD_DEFAULT_HOST,
+        port: TMWD_DEFAULT_PORT,
+        secure: TMWD_DEFAULT_SECURE,
+        wsUrl: TMWD_DEFAULT_WS_URL || null,
+      },
       stored: {
         host: typeof stored[TMWD_STORAGE_HOST] === 'string' ? stored[TMWD_STORAGE_HOST] : null,
         port: stored[TMWD_STORAGE_PORT] ?? null,
+        secure: stored[TMWD_STORAGE_SECURE] ?? null,
       },
       effective,
     };
@@ -206,31 +270,48 @@ async function handleExtMessage(msg, sender) {
   if (msg.cmd === 'tmwd_bridge_set') {
     const rawHost = msg.host !== undefined && msg.host !== null ? String(msg.host).trim() : '';
     if (!rawHost) {
-      await chrome.storage.local.remove([TMWD_STORAGE_HOST, TMWD_STORAGE_PORT]);
+      await chrome.storage.local.remove([
+        TMWD_STORAGE_HOST,
+        TMWD_STORAGE_PORT,
+        TMWD_STORAGE_SECURE,
+      ]);
+      await tmwdReconnectBridge();
       const effective = await loadBridgeEndpoint();
       return { ok: true, effective, cleared: true };
     }
-    const n = parseInt(String(msg.port ?? ''), 10);
-    if (!Number.isFinite(n) || n < 1 || n > 65535) {
+    const parsed = tmwdParseWsUrl(rawHost);
+    let host = rawHost;
+    let port = parseInt(String(msg.port ?? ''), 10);
+    let secure = !!msg.secure;
+    if (parsed) {
+      host = parsed.host;
+      if (!Number.isFinite(port)) port = parsed.port;
+      secure = parsed.secure;
+    }
+    if (!Number.isFinite(port) || port < 1 || port > 65535) {
       return { ok: false, error: '端口须为 1–65535 的整数' };
     }
     await chrome.storage.local.set({
-      [TMWD_STORAGE_HOST]: rawHost,
-      [TMWD_STORAGE_PORT]: n,
+      [TMWD_STORAGE_HOST]: host,
+      [TMWD_STORAGE_PORT]: port,
+      [TMWD_STORAGE_SECURE]: secure,
     });
+    await tmwdReconnectBridge();
     const effective = await loadBridgeEndpoint();
     return { ok: true, effective };
   }
   if (msg.cmd === 'tmwd_bridge_status') {
     const ep = await loadBridgeEndpoint();
-    const wsUrl = tmwdBridgeWsUrl(ep.host, ep.port);
+    const wsUrl = tmwdBridgeWsUrl(ep);
     let httpReachable = false;
-    try {
-      const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 1200);
-      await fetch(tmwdBridgeHttpUrl(ep.host, ep.port), { signal: ctrl.signal });
-      httpReachable = true;
-    } catch (_) {}
+    if (!ep.skipHttpProbe) {
+      try {
+        const ctrl = new AbortController();
+        setTimeout(() => ctrl.abort(), 1200);
+        await fetch(tmwdBridgeHttpUrl(ep.host, ep.port), { signal: ctrl.signal });
+        httpReachable = true;
+      } catch (_) {}
+    }
     const rs = ws ? ws.readyState : null;
     let phase = 'disconnected';
     if (rs === WebSocket.OPEN) phase = 'connected';
@@ -242,7 +323,8 @@ async function handleExtMessage(msg, sender) {
       wsUrl,
       wsReadyState: rs,
       phase,
-      httpReachable,
+      httpReachable: ep.skipHttpProbe ? null : httpReachable,
+      skipHttpProbe: ep.skipHttpProbe,
       lastClose: { ...tmwdCloseInfo },
       lastError: tmwdLastError || '',
     };
@@ -434,6 +516,7 @@ function scheduleKeepalive() {
 async function isServerAlive() {
   try {
     const ep = await loadBridgeEndpoint();
+    if (ep.skipHttpProbe) return true;
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), 2000);
     await fetch(tmwdBridgeHttpUrl(ep.host, ep.port), { signal: ctrl.signal });
@@ -552,7 +635,7 @@ async function connectWS() {
     console.error('[TMWD-WS] loadBridgeEndpoint', e);
     ep = { host: TMWD_DEFAULT_HOST, port: TMWD_DEFAULT_PORT };
   }
-  const wsUrl = tmwdBridgeWsUrl(ep.host, ep.port);
+  const wsUrl = tmwdBridgeWsUrl(ep);
   console.log('[TMWD-WS] Connecting to', wsUrl);
   try {
     ws = new WebSocket(wsUrl);

@@ -21,16 +21,19 @@ hr{border:none;border-top:1px solid #3c3c3c;margin:10px 0}
 </style>
 </head>
 <body>
-<p class="hint" style="margin:0 0 8px 0">入口：浏览器<strong>工具栏上的本扩展图标</strong>（若未固定，先点拼图图标 ⊕ 再图钉固定）；也可在 <code>chrome://extensions</code> 找到本扩展 → 详情 → <strong>扩展程序选项</strong>。</p>
+<p class="hint" style="margin:0 0 8px 0">桥接地址在下方配置，保存后写入浏览器本地存储；<code>config.js</code> 仅为首次安装默认值，MCP 不会覆盖你的设置。</p>
 <h3>桥接地址</h3>
 <p id="tmwdConnStatus" class="conn-line conn-wait">正在读取连接状态…</p>
 <div class="row">
-  <label for="tmwdHost">主机</label>
-  <input id="tmwdHost" type="text" placeholder="127.0.0.1" autocomplete="off" />
+  <label for="tmwdHost">主机（可填 wss://域名:端口）</label>
+  <input id="tmwdHost" type="text" placeholder="gac.fn.t8.ee 或 wss://gac.fn.t8.ee:83" autocomplete="off" />
 </div>
 <div class="row">
-  <label for="tmwdPort">端口（与 TMWebDriver WebSocket 一致）</label>
-  <input id="tmwdPort" type="number" min="1" max="65535" placeholder="18865" />
+  <label for="tmwdPort">端口（WSS 反代填对外端口，如 83）</label>
+  <input id="tmwdPort" type="number" min="1" max="65535" placeholder="83" />
+</div>
+<div class="row">
+  <label><input id="tmwdSecure" type="checkbox" /> 使用 WSS (TLS / 反代)</label>
 </div>
 <button type="button" id="tmwdSave">保存并重连</button>
 <button type="button" id="tmwdReset">恢复默认</button>

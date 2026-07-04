@@ -33,6 +33,7 @@ mcp = FastMCP(
 _driver: Optional[TMWebDriver] = None
 _DRIVER_PORT = int(os.environ.get("AGENT_BROWSER_TMWD_PORT", "18865"))
 _DRIVER_BIND = (os.environ.get("AGENT_BROWSER_TMWD_BIND") or "0.0.0.0").strip() or "0.0.0.0"
+_DRIVER_HOST = (os.environ.get("AGENT_BROWSER_TMWD_HOST") or "127.0.0.1").strip() or "127.0.0.1"
 
 
 def detect_lan_ip() -> str:
@@ -45,15 +46,12 @@ def detect_lan_ip() -> str:
     except Exception:
         return "127.0.0.1"
 
-
-def resolve_connect_host() -> str:
-    explicit = (os.environ.get("AGENT_BROWSER_TMWD_HOST") or "").strip()
-    if explicit:
-        return explicit
-    return detect_lan_ip()
-
-
-_DRIVER_HOST = resolve_connect_host()
+_CONFIG_JS_DEFAULTS = (
+    'const TID = \'{tid}\';\n'
+    'var TMWD_HOST = "127.0.0.1";\n'
+    'var TMWD_PORT = 18865;\n'
+    'var TMWD_SECURE = false;\n'
+)
 
 
 def chrome_extension_dir() -> Path:
@@ -62,24 +60,15 @@ def chrome_extension_dir() -> Path:
 
 def ensure_config_js() -> Path:
     path = chrome_extension_dir() / "config.js"
-    host = resolve_connect_host()
-    port = int(os.environ.get("AGENT_BROWSER_TMWD_PORT", "18865"))
-    port = max(1, min(65535, port))
-    tid: Optional[str] = None
-    if path.exists():
-        prev = path.read_text(encoding="utf-8")
-        m = re.search(r"const\s+TID\s*=\s*'([^']*)'", prev)
-        if m:
-            tid = m.group(1)
-    if not tid:
+    if not path.exists():
         tid = f"__ljq_{hex(random.randint(0, 99999999))[2:8]}"
-    body = (
-        f"const TID = '{tid}';\n"
-        f"var TMWD_HOST = {json.dumps(host)};\n"
-        f"var TMWD_PORT = {port};\n"
-    )
-    if not path.exists() or path.read_text(encoding="utf-8") != body:
-        path.write_text(body, encoding="utf-8")
+        path.write_text(_CONFIG_JS_DEFAULTS.format(tid=tid), encoding="utf-8")
+        return path
+    prev = path.read_text(encoding="utf-8")
+    if re.search(r"const\s+TID\s*=", prev):
+        return path
+    tid = f"__ljq_{hex(random.randint(0, 99999999))[2:8]}"
+    path.write_text(_CONFIG_JS_DEFAULTS.format(tid=tid), encoding="utf-8")
     return path
 
 
@@ -158,15 +147,19 @@ def compact_tabs() -> list[dict[str, Any]]:
 def get_setup_status() -> dict[str, Any]:
     driver = get_driver()
     sessions = compact_tabs()
+    lan_ip = detect_lan_ip()
     return {
         "extension_name": "Auto Publisher Bridge",
         "extension_path": str(chrome_extension_dir()),
         "config_js": str(ensure_config_js()),
         "tmwebdriver_bind_host": _DRIVER_BIND,
-        "tmwebdriver_connect_host": _DRIVER_HOST,
-        "tmwebdriver_host": _DRIVER_HOST,
-        "tmwebdriver_ws_port": _DRIVER_PORT,
+        "tmwebdriver_listen_port": _DRIVER_PORT,
         "tmwebdriver_http_port": _DRIVER_PORT + 1,
+        "lan_ip": lan_ip,
+        "listen_ws_urls": [
+            f"ws://127.0.0.1:{_DRIVER_PORT}",
+            f"ws://{lan_ip}:{_DRIVER_PORT}",
+        ],
         "remote_mode": driver.is_remote,
         "connected_tabs": len(sessions),
         "default_session_id": driver.default_session_id,
@@ -174,8 +167,10 @@ def get_setup_status() -> dict[str, Any]:
         "notes": [
             "Load the unpacked extension from extension_path in chrome://extensions with Developer Mode enabled.",
             "Keep a normal http/https page open in Chrome; about:blank is not enough.",
-            "Bridge listens on all interfaces (bind 0.0.0.0). Extension default host is LAN IP; override via AGENT_BROWSER_TMWD_HOST or extension popup.",
-            "Remote Chrome on another PC: set extension host to this machine's LAN IP and ensure firewall allows ports ws/http.",
+            "Server listens on 0.0.0.0 (all interfaces). Extension address is configured in popup, not overwritten by MCP.",
+            f"LAN extension example: host={lan_ip}, port={_DRIVER_PORT}, WSS unchecked.",
+            f"Local extension example: host=127.0.0.1, port={_DRIVER_PORT}, WSS unchecked.",
+            f"WSS reverse-proxy example: host=wss://your-domain:port in popup, WSS checked.",
         ],
     }
 

@@ -6,7 +6,7 @@ import socket
 import sys
 from pathlib import Path
 
-from server import ROOT, ensure_config_js, get_driver, chrome_extension_dir, mcp
+from server import ROOT, ensure_config_js, get_driver, chrome_extension_dir, mcp, detect_lan_ip, _DRIVER_BIND, _DRIVER_PORT
 
 
 def cmd_extension_path() -> int:
@@ -39,8 +39,10 @@ def _port_open(host: str, port: int) -> bool:
 def cmd_doctor() -> int:
     ensure_config_js()
     driver = get_driver()
-    ws_port = getattr(driver, "port", 18865)
+    ws_port = getattr(driver, "port", _DRIVER_PORT)
     http_port = ws_port + 1
+    bind_host = getattr(driver, "bind_host", _DRIVER_BIND)
+    lan_ip = detect_lan_ip()
     sessions = []
     err = None
     try:
@@ -49,20 +51,28 @@ def cmd_doctor() -> int:
         err = str(e)
     payload = {
         "extension_path": str(chrome_extension_dir()),
-        "config_js": str((chrome_extension_dir() / 'config.js').resolve()),
+        "config_js": str((chrome_extension_dir() / "config.js").resolve()),
         "remote_mode": getattr(driver, "is_remote", False),
-        "tmwebdriver_host": getattr(driver, "host", "127.0.0.1"),
-        "tmwebdriver_ws_port": ws_port,
+        "tmwebdriver_bind_host": bind_host,
+        "tmwebdriver_listen_port": ws_port,
         "tmwebdriver_http_port": http_port,
-        "ws_port_open": _port_open(getattr(driver, "host", "127.0.0.1"), ws_port),
-        "http_port_open": _port_open(getattr(driver, "host", "127.0.0.1"), http_port),
+        "lan_ip": lan_ip,
+        "ws_port_open_local": _port_open("127.0.0.1", ws_port),
+        "ws_port_open_lan": _port_open(lan_ip, ws_port),
+        "http_port_open_local": _port_open("127.0.0.1", http_port),
+        "http_port_open_lan": _port_open(lan_ip, http_port),
         "connected_tabs": len(sessions),
         "tabs": sessions,
         "error": err,
+        "extension_connect_examples": {
+            "local": {"host": "127.0.0.1", "port": ws_port, "secure": False},
+            "lan": {"host": lan_ip, "port": ws_port, "secure": False},
+        },
         "next_steps": [
-            "Load the unpacked extension in chrome://extensions from extension_path.",
+            "Load the unpacked extension from extension_path.",
             "Open a normal http/https page in Chrome.",
-            "Run `hermes mcp test agent_browser` after adding the MCP config.",
+            "Configure extension popup: 127.0.0.1 for local, LAN IP for other devices on network.",
+            "Ensure firewall allows inbound TCP on ws/http ports when using LAN.",
         ],
     }
     print(json.dumps(payload, ensure_ascii=False, indent=2))

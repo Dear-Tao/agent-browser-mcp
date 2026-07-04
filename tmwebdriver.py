@@ -174,7 +174,10 @@ class TMWebDriver:
         server_thread = threading.Thread(target=self.server.serve_forever)  
         server_thread.daemon = True  
         server_thread.start()  
-        _safe_print(f"WebSocket server listening on ws://{self.bind_host}:{self.port}, connect via ws://{self.host}:{self.port}")  
+        _safe_print(
+            f"WebSocket server listening on {self.bind_host}:{self.port} "
+            f"(ws://127.0.0.1:{self.port} or ws://<LAN-IP>:{self.port})"
+        )
     
     def _register_client(self, session_id: str, client: WebSocket, session_info) -> None:  
         is_new_session = session_id not in self.sessions

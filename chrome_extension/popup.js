@@ -6,6 +6,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const hostEl = document.getElementById('tmwdHost');
   const portEl = document.getElementById('tmwdPort');
+  const secureEl = document.getElementById('tmwdSecure');
   const saveBtn = document.getElementById('tmwdSave');
   const resetBtn = document.getElementById('tmwdReset');
   const refreshConnBtn = document.getElementById('tmwdRefreshConn');
@@ -35,7 +36,9 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
       let hint = '';
-      if (!httpOk) {
+      if (r.skipHttpProbe) {
+        hint = 'WSS 反代模式：已跳过 HTTP 探测，仅尝试 WebSocket 连接。';
+      } else if (!httpOk) {
         hint = '该地址 HTTP 探测无响应：请确认已启动 MCP/TMWebDriver，且主机端口与 Python 一致。';
       } else {
         hint = '端口可达但未建立 WebSocket，可稍候或点「保存并重连」。';
@@ -65,12 +68,14 @@ document.addEventListener('DOMContentLoaded', () => {
       const eff = r.effective || {};
       hostEl.value = eff.host || '';
       portEl.value = eff.port != null ? String(eff.port) : '';
+      if (secureEl) secureEl.checked = !!eff.secure;
       const d = r.defaults || {};
       const st = r.stored || {};
-      const usingFile = st.host == null && st.port == null;
+      const usingFile = st.host == null && st.port == null && st.secure == null;
+      const scheme = eff.secure ? 'wss' : 'ws';
       cfgHintEl.textContent = usingFile
-        ? `配置来源：config.js 默认（${d.host}:${d.port}）`
-        : `配置来源：已用弹窗覆盖；文件默认仍为 ${d.host}:${d.port}`;
+        ? `配置来源：config.js 默认（${scheme}://${d.host}:${d.port}）`
+        : `配置来源：已用弹窗覆盖；文件默认仍为 ${d.secure ? 'wss' : 'ws'}://${d.host}:${d.port}`;
     } catch (e) {
       cfgHintEl.textContent = '读取失败: ' + e.message;
     }
@@ -99,7 +104,12 @@ document.addEventListener('DOMContentLoaded', () => {
         await refreshConnStatus();
         return;
       }
-      const r = await chrome.runtime.sendMessage({ cmd: 'tmwd_bridge_set', host, port });
+      const r = await chrome.runtime.sendMessage({
+        cmd: 'tmwd_bridge_set',
+        host,
+        port,
+        secure: secureEl ? secureEl.checked : false,
+      });
       if (!r?.ok) {
         cfgHintEl.textContent = r?.error || '保存失败';
         await refreshConnStatus();
