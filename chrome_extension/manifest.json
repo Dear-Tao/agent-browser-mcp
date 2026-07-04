@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Auto Publisher Bridge",
+  "version": "1.0.0",
+  "description": "桥接 MCP 与真实 Chrome。点工具栏图标打开弹窗（顶部可设桥接地址）；或在 chrome://extensions 本扩展详情中打开「扩展程序选项」。",
+  "permissions": [
+    "cookies",
+    "tabs",
+    "activeTab",
+    "debugger",
+    "scripting",
+    "alarms",
+    "declarativeNetRequest",
+    "management",
+    "storage"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["disable_dialogs.js"],
+      "run_at": "document_start",
+      "all_frames": true,
+      "world": "MAIN"
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["config.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Auto Publisher Bridge：点此打开弹窗（桥接地址在顶部）"
+  },
+  "options_ui": {
+    "page": "popup.html",
+    "open_in_tab": true
+  }
+}

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+body{width:420px;max-height:560px;margin:0;padding:8px;font:12px monospace;background:#1e1e1e;color:#d4d4d4;overflow-y:auto}
+h3{margin:4px 0;color:#569cd6}
+.row{margin-bottom:6px}
+.row label{display:block;color:#9cdcfe;margin-bottom:2px}
+input{width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid #3c3c3c;border-radius:3px;background:#252526;color:#d4d4d4;font:inherit}
+button{background:#264f78;color:#fff;border:none;padding:4px 12px;cursor:pointer;border-radius:3px;margin-right:6px;margin-bottom:6px}
+button:hover{background:#37699e}
+.hint{font-size:11px;color:#858585;margin-top:4px}
+pre{white-space:pre-wrap;word-break:break-all;margin:0;padding:6px;background:#252526;border-radius:3px;max-height:280px;overflow-y:auto}
+hr{border:none;border-top:1px solid #3c3c3c;margin:10px 0}
+.conn-line{margin:6px 0;padding:8px 10px;border-radius:4px;font-weight:bold;line-height:1.35;white-space:pre-wrap}
+.conn-ok{background:#1a2e1a;color:#7ee787;border:1px solid #2f5a2f}
+.conn-warn{background:#2e2a12;color:#f5d742;border:1px solid #5a5418}
+.conn-bad{background:#2e1a1a;color:#ff9d9d;border:1px solid #5a2a2a}
+.conn-wait{background:#252526;color:#9cdcfe;border:1px solid #3c3c3c}
+</style>
+</head>
+<body>
+<p class="hint" style="margin:0 0 8px 0">入口：浏览器<strong>工具栏上的本扩展图标</strong>（若未固定，先点拼图图标 ⊕ 再图钉固定）；也可在 <code>chrome://extensions</code> 找到本扩展 → 详情 → <strong>扩展程序选项</strong>。</p>
+<h3>桥接地址</h3>
+<p id="tmwdConnStatus" class="conn-line conn-wait">正在读取连接状态…</p>
+<div class="row">
+  <label for="tmwdHost">主机</label>
+  <input id="tmwdHost" type="text" placeholder="127.0.0.1" autocomplete="off" />
+</div>
+<div class="row">
+  <label for="tmwdPort">端口（与 TMWebDriver WebSocket 一致）</label>
+  <input id="tmwdPort" type="number" min="1" max="65535" placeholder="18865" />
+</div>
+<button type="button" id="tmwdSave">保存并重连</button>
+<button type="button" id="tmwdReset">恢复默认</button>
+<button type="button" id="tmwdRefreshConn">刷新连接状态</button>
+<p id="tmwdCfgHint" class="hint"></p>
+
+<hr />
+
+<h3>🍪 Cookies</h3>
+<button id="refresh">刷新</button>
+<pre id="out">点击刷新获取 cookies...</pre>
+<script src="popup.js"></script>
+</body>
+</html>
