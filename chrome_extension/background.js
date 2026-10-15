@@ -339,6 +339,18 @@ async function handleExtMessage(msg, sender) {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return { ok: true };
+      } else if (msg.method === 'create') {
+        // Opening from the extension side sidesteps Chrome's popup blocker: an
+        // injected page script carries no user gesture, so window.open() and the
+        // anchor fallback are both suppressed on most sites.
+        const tab = await chrome.tabs.create({ url: msg.url, active: msg.active !== false });
+        return { ok: true, data: { id: tab.id, url: tab.url, title: tab.title } };
+      } else if (msg.method === 'close') {
+        const ids = (Array.isArray(msg.tabIds) ? msg.tabIds : [msg.tabId])
+          .filter((id) => typeof id === 'number');
+        if (!ids.length) return { ok: false, error: 'no tab ids to close' };
+        await chrome.tabs.remove(ids);
+        return { ok: true, closed: ids };
       } else {
         const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
         const data = tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }));

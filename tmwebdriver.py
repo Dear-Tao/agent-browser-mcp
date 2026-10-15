@@ -299,7 +299,31 @@ class TMWebDriver:
     def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
     def newtab(self, url=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab("{url}");')
+        # Preferred: let the extension create the tab. An injected page script carries
+        # no user gesture, so Chrome's popup blocker suppresses both window.open() and
+        # the anchor fallback on most sites; chrome.tabs.create() is not affected.
+        # An older service worker answers a create request with the tab list instead,
+        # which we detect by shape and fall back from.
+        try:
+            r = self.execute_js(
+                json.dumps({"cmd": "tabs", "method": "create", "url": url}), timeout=10)
+            data = r.get('data') if isinstance(r, dict) else r
+            if isinstance(data, dict) and data.get('id'):
+                return {'via': 'extension', **data}
+            _safe_print('tabs/create not supported by this service worker; using page script')
+        except Exception as exc:
+            _safe_print('tabs/create failed; using page script:', str(exc)[:120])
+        return self.execute_js(f'''
+            (function () {{
+                var w = window.open({json.dumps(url)}, "_blank");
+                if (w) return "window.open";
+                var a = document.createElement("a");
+                a.href = {json.dumps(url)}; a.target = "_blank"; a.rel = "noopener";
+                (document.body || document.documentElement).appendChild(a);
+                a.click(); a.remove();
+                return "anchor-click";
+            }})()
+        ''')
     
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18865)

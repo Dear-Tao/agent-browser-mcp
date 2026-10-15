@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 os.environ.setdefault("PYAUTO_GUI_NO_FAILSAFE", "1")
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -21,12 +21,20 @@ if str(ROOT) not in sys.path:
 
 from tmwebdriver import TMWebDriver  # noqa: E402
 import simphtml  # noqa: E402
+import semantic  # noqa: E402
 
-mcp = FastMCP(
+mcp = MCPServer(
     name="agent-browser",
     instructions=(
         "Browser automation tools for the user's real Chrome session via TMWebDriver/CDP bridge. "
-        "Supports page scanning, JS execution, CDP commands, screenshots, cookies, and desktop physical input."
+        "Supports page scanning, JS execution, CDP commands, screenshots, cookies, and desktop physical input.\n\n"
+        "Preferred flow for interacting with a page (avoids inventing CSS selectors each time):\n"
+        "  1. page_snapshot()  -> interactive elements as {ref, role, name, tag}, plus a docId.\n"
+        "  2. element_action(ref='e7', action='click') to act on one.\n"
+        "  Use find_element(role='button', name='Save') when you know the semantics but not the layout.\n"
+        "  Pass the docId you acted on back as expect_doc_id: if the page navigated underneath you the\n"
+        "  call returns status='uncertain' instead of guessing, and nothing is replayed.\n"
+        "  scan_page stays available for reading raw rendered content; desktop_* tools drive the OS itself."
     ),
 )
 
@@ -34,6 +42,26 @@ _driver: Optional[TMWebDriver] = None
 _DRIVER_PORT = int(os.environ.get("AGENT_BROWSER_TMWD_PORT", "18865"))
 _DRIVER_BIND = (os.environ.get("AGENT_BROWSER_TMWD_BIND") or "0.0.0.0").strip() or "0.0.0.0"
 _DRIVER_HOST = (os.environ.get("AGENT_BROWSER_TMWD_HOST") or "127.0.0.1").strip() or "127.0.0.1"
+
+# Tabs the agent opened. Cleanup closes only what it created and never the user's
+# own tabs. Modes: agent (reclaimable) | handoff / deliverable (kept) | release
+# (hand control back; the tab is never closed).
+_TAB_OWNERS: dict[str, dict[str, Any]] = {}
+
+
+def _security_note() -> dict[str, Any]:
+    """Surface LAN exposure explicitly: the bridge has no pairing token."""
+    exposed = _DRIVER_BIND not in ("127.0.0.1", "localhost", "::1")
+    return {
+        "bind_host": _DRIVER_BIND,
+        "lan_exposed": exposed,
+        "pairing_token": False,
+        "note": (
+            "Bridge listens on all interfaces with no pairing token: anything on the same "
+            "network can drive this browser. Set AGENT_BROWSER_TMWD_BIND=127.0.0.1 unless you "
+            "genuinely need another device on the LAN."
+        ) if exposed else "Bridge is loopback-only.",
+    }
 
 
 def detect_lan_ip() -> str:
@@ -164,6 +192,7 @@ def get_setup_status() -> dict[str, Any]:
         "connected_tabs": len(sessions),
         "default_session_id": driver.default_session_id,
         "tabs": sessions,
+        "security": _security_note(),
         "notes": [
             "Load the unpacked extension from extension_path in chrome://extensions with Developer Mode enabled.",
             "Keep a normal http/https page open in Chrome; about:blank is not enough.",
@@ -203,11 +232,141 @@ def open_url(url: str, session_id: Optional[str] = None, timeout: float = 15.0) 
     }
 
 
-@mcp.tool(description="Open a new browser tab with the given URL.")
-def open_new_tab(url: str) -> dict[str, Any]:
+@mcp.tool(description=(
+    "Open a new browser tab with the given URL. Pass track=True to record it as an "
+    "agent-created tab, so close_agent_tabs can reclaim it later without ever touching "
+    "the user's own tabs."
+))
+def open_new_tab(url: str, track: bool = False) -> dict[str, Any]:
     driver = require_driver()
+    before = {str(s.get("id")) for s in active_sessions()}
     result = driver.newtab(url)
-    return {"status": "ok", "result": result, "tabs": compact_tabs()}
+    # The extension reports new tabs on its next push, which can lag the page's
+    # window.open by a beat. Poll briefly so track=True actually records it.
+    claimed: list[str] = []
+    for _ in range(15):
+        time.sleep(0.2)
+        for sess in active_sessions():
+            sid = str(sess.get("id"))
+            if sid not in before and sid not in claimed:
+                claimed.append(sid)
+        if claimed:
+            break
+    if claimed:
+        for sess in active_sessions():
+            sid = str(sess.get("id"))
+            if sid in claimed:
+                _TAB_OWNERS[sid] = {
+                    "url": sess.get("url"),
+                    "title": sess.get("title"),
+                    "mode": "agent",
+                }
+    return {
+        "status": "ok" if claimed else "unavailable",
+        "result": result,
+        "tracked": claimed if track else [],
+        "new_tabs_seen": claimed,
+        "note": None if claimed else (
+            "The page blocked window.open and the anchor fallback, so no new tab appeared. "
+            "Switch to a page that allows new tabs, or navigate an existing tab with open_url."
+        ),
+        "tabs": compact_tabs(),
+        "owned_tabs": dict(_TAB_OWNERS),
+    }
+
+
+@mcp.tool(description=(
+    "Set the lifecycle mode of a tab this agent opened: 'agent' (reclaimable, default), "
+    "'handoff' or 'deliverable' (keep it past cleanup), or 'release' (give control back to the "
+    "user; the tab is never closed). Never closes anything by itself."
+))
+def mark_tab(mode: str, session_id: Optional[str] = None) -> dict[str, Any]:
+    if mode not in ("agent", "handoff", "deliverable", "release"):
+        raise RuntimeError("mode must be one of: agent, handoff, deliverable, release")
+    sid = str(session_id) if session_id is not None else str(require_driver().default_session_id)
+    entry = _TAB_OWNERS.get(sid)
+    if entry is None:
+        live = next((s for s in active_sessions() if str(s.get("id")) == sid), None)
+        if live is None:
+            raise RuntimeError(f"Tab {sid} is not connected and was never tracked by the agent")
+        _TAB_OWNERS[sid] = {"url": live.get("url"), "title": live.get("title"), "mode": mode}
+    else:
+        entry["mode"] = mode
+    return {"session_id": sid, "mode": mode, "owned_tabs": dict(_TAB_OWNERS)}
+
+
+def _tab_still_open(driver: TMWebDriver, sid: str) -> bool:
+    return any(str(s.get("id")) == sid for s in active_sessions())
+
+
+def _try_close_tab(driver: TMWebDriver, sid: str, previous: Optional[str]) -> str:
+    """Close one agent-owned tab and verify it actually went away.
+
+    Two paths on purpose: the extension's tabs/close is the clean one, but it only
+    exists once the unpacked extension has been reloaded, and an older service
+    worker answers a close request with a tab list instead of closing anything.
+    So every attempt is verified, and the fallback is page-side window.close() -
+    legal precisely because the agent opened these tabs itself via open_new_tab.
+    """
+    for path in ("extension", "window"):
+        try:
+            driver.default_session_id = sid
+            if path == "extension":
+                driver.execute_js(
+                    json.dumps({"cmd": "tabs", "method": "close", "tabIds": [int(sid)]}),
+                    timeout=10,
+                )
+            else:
+                driver.execute_js("window.close(); return true;", timeout=8)
+        except Exception:
+            continue
+        time.sleep(0.5)
+        if not _tab_still_open(driver, sid):
+            driver.default_session_id = previous
+            return path
+    driver.default_session_id = previous
+    return "failed"
+
+
+@mcp.tool(description=(
+    "Close tabs this agent opened that are still marked 'agent'. Tabs marked handoff, "
+    "deliverable or release, and every tab the user opened, are left untouched. Each close is "
+    "verified, so this reports exactly what went away, what it used, and what it could not close."
+))
+def close_agent_tabs(mode: str = "agent") -> dict[str, Any]:
+    driver = require_driver()
+    live = {str(s.get("id")) for s in active_sessions()}
+    targets, keep, gone = [], {}, []
+    for sid, entry in list(_TAB_OWNERS.items()):
+        if sid not in live:
+            gone.append(sid)
+            _TAB_OWNERS.pop(sid, None)
+        elif entry.get("mode") == mode:
+            targets.append(sid)
+        else:
+            keep[sid] = entry.get("mode")
+
+    previous = driver.default_session_id
+    closed: dict[str, str] = {}
+    failed: list[str] = []
+    for sid in targets:
+        how = _try_close_tab(driver, sid, previous)
+        if how == "failed":
+            failed.append(sid)
+        else:
+            closed[sid] = how
+            _TAB_OWNERS.pop(sid, None)
+
+    return {
+        "status": "ok" if not failed else "partial",
+        "requested_mode": mode,
+        "closed": closed,
+        "closed_via": sorted(set(closed.values())),
+        "failed": failed,
+        "already_gone": gone,
+        "kept": keep,
+        "user_tabs_untouched": sorted(live - set(targets)),
+    }
 
 
 @mcp.tool(description="Get absolute path to the unpacked Chrome extension directory for manual installation.")
@@ -252,6 +411,88 @@ def scan_page(
         "tabs": compact_tabs(),
         "content": content,
     }
+
+
+@mcp.tool(description=(
+    "Cheap identity probe for the current document: docId, url, title, readiness and how many "
+    "element refs are still live. Call this after an action that reported status='uncertain' to "
+    "see whether the page really moved on."
+))
+def page_state(session_id: Optional[str] = None) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.page_state(require_driver())
+
+
+@mcp.tool(description=(
+    "Bounded interactive-element snapshot of the current page. Returns {ref, role, name, tag} "
+    "for visible actionable nodes plus the document's docId, so you can act on them later with "
+    "element_action(ref=...) instead of writing a CSS selector each time. e-refs are reset by this "
+    "call; budget-bounded by limit/max_chars, and credential-shaped entries are flagged 'redacted'."
+))
+def page_snapshot(
+    session_id: Optional[str] = None,
+    interactive_only: bool = True,
+    limit: int = 200,
+    max_chars: int = 20000,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.page_snapshot(
+        require_driver(), interactive_only=interactive_only, limit=limit, max_chars=max_chars
+    )
+
+
+@mcp.tool(description=(
+    "Find elements by meaning rather than by selector: role ('button'/'link'/'textbox'/'checkbox'), "
+    "name (substring of the accessible name), label, placeholder, text, testid, or an explicit CSS "
+    "selector. Returns f-refs usable with element_action, and reports how many matched in total so "
+    "you can tell an ambiguous hit from a unique one (use nth to disambiguate). Does not disturb "
+    "the page; it only reads."
+))
+def find_element(
+    role: str = "",
+    name: str = "",
+    label: str = "",
+    placeholder: str = "",
+    text: str = "",
+    testid: str = "",
+    selector: str = "",
+    nth: Optional[int] = None,
+    count: int = 10,
+    interactive_only: bool = True,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.find_element(
+        require_driver(),
+        role=role, name=name, label=label, placeholder=placeholder,
+        text=text, testid=testid, selector=selector, nth=nth, count=count,
+        interactive_only=interactive_only,
+    )
+
+
+@mcp.tool(description=(
+    "Act on an element ref from page_snapshot (e1, e2...) or find_element (f1, f2...). Actions: "
+    "click, fill (value), clear, select (value), check, uncheck, hover, focus, scrollIntoView, and "
+    "read-only exists / text / isEnabled / attrs. Always pass the docId you observed as "
+    "expect_doc_id: if the document changed underneath the ref, the call returns "
+    "status='uncertain' and does NOT replay the action, so a timed-out click can never silently "
+    "become a duplicate order."
+))
+def element_action(
+    ref: str,
+    action: str = "click",
+    value: Optional[str] = None,
+    expect_doc_id: str = "",
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.element_action(
+        require_driver(), ref=ref, action=action, value=value, expect_doc_id=expect_doc_id
+    )
 
 
 @mcp.tool(description="Execute arbitrary JS in the current page context or send JSON CDP bridge commands through the page bridge.")
