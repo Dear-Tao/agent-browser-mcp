@@ -17,6 +17,24 @@ def _safe_print(*args, **kwargs):
         print(fallback, end=end, file=sys.stderr)
 
 
+def make_ext_session_id(browser_id: str, tab_id) -> str:
+    """多浏览器下 Chrome tabId 会撞号，会话键必须带上稳定的 browser_id。"""
+    bid = str(browser_id or '').strip()
+    tid = str(tab_id)
+    return f"{bid}:{tid}" if bid else tid
+
+
+def chrome_tab_id_of(session) -> int:
+    """从会话解析扩展侧 chrome.tabs 用的数字 tabId。"""
+    info = getattr(session, 'info', None) or {}
+    if info.get('tab_id') is not None:
+        return int(info['tab_id'])
+    sid = str(getattr(session, 'id', '') or '')
+    if ':' in sid:
+        return int(sid.rsplit(':', 1)[-1])
+    return int(sid)
+
+
 class Session:
     def __init__(self, session_id, info, client=None):
         self.id = session_id
@@ -143,19 +161,68 @@ class TMWebDriver:
                             'connected_at': time.time(), 'type': 'ws'}  
                         driver._register_client(session_id, self, session_info)  
                     elif data.get('type') in ['ext_ready', 'tabs_update']:
+                        # 多浏览器/多扩展可同时连：只按「本 WS 客户端」维护自己的标签，
+                        # 禁止用一端的 tabs 列表把另一端的 ext_ws 会话标断开。
                         tabs = data.get('tabs', [])
-                        current_tab_ids = {str(tab['id']) for tab in tabs}
-                        _safe_print(f"Received tabs update: {current_tab_ids}")
+                        browser_meta = data.get('browser') or {}
+                        browser_id = browser_meta.get('id') or ''
+                        browser_label = browser_meta.get('label') or ''
+                        current_tab_ids = {
+                            make_ext_session_id(
+                                tab.get('browser_id') or browser_id or '',
+                                tab['id'],
+                            )
+                            for tab in tabs
+                        }
+                        _safe_print(
+                            f"Received tabs update from {self.address} "
+                            f"browser={browser_label or browser_id or '-'}: "
+                            f"{len(tabs)} tabs {current_tab_ids}"
+                        )
                         for sid in list(driver.sessions.keys()):
                             sess = driver.sessions[sid]
-                            if sess.type == 'ext_ws' and sid not in current_tab_ids:
+                            if (
+                                sess.type == 'ext_ws'
+                                and sess.ws_client is self
+                                and sid not in current_tab_ids
+                            ):
                                 sess.mark_disconnected()
                         for tab in tabs:
-                            session_id = str(tab['id'])
-                            session_info = {'url': tab.get('url'), 'title': tab.get('title', ''), 'connected_at': time.time(), 'type': 'ext_ws'}
+                            bid = tab.get('browser_id') or browser_id or ''
+                            blabel = tab.get('browser_label') or browser_label or bid or ''
+                            tab_id = tab.get('id')
+                            session_id = make_ext_session_id(bid, tab_id)
+                            # 兼容旧会话键（纯 tabId）：同连接则迁到 namespaced id
+                            legacy_id = str(tab_id)
+                            if (
+                                session_id != legacy_id
+                                and legacy_id in driver.sessions
+                                and driver.sessions[legacy_id].ws_client is self
+                            ):
+                                old = driver.sessions.pop(legacy_id)
+                                old.mark_disconnected()
                             sess = driver.sessions.get(session_id)
-                            if sess and sess.is_active(): sess.info = session_info
-                            else: driver._register_client(session_id, self, session_info)
+                            base_info = {
+                                'url': tab.get('url'),
+                                'title': tab.get('title', ''),
+                                'type': 'ext_ws',
+                                'tab_id': int(tab_id) if tab_id is not None else None,
+                                'browser_id': bid,
+                                'browser_label': blabel,
+                            }
+                            if sess and sess.is_active() and sess.ws_client is self:
+                                # 同连接刷新元数据，保留首次 connected_at 便于区分来源
+                                prev_at = (sess.info or {}).get('connected_at')
+                                sess.info = {
+                                    **base_info,
+                                    'connected_at': prev_at if prev_at is not None else time.time(),
+                                }
+                            else:
+                                session_info = {
+                                    **base_info,
+                                    'connected_at': time.time(),
+                                }
+                                driver._register_client(session_id, self, session_info)
                     elif data.get('type') == 'ack': driver.acks[data.get('id','')] = True
                     elif data.get('type') == 'result':  
                         driver.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}  
@@ -224,7 +291,8 @@ class TMWebDriver:
         assert tp in ['ws', 'http', 'ext_ws'], f"Unsupported session type: {tp}"
         exec_id = str(uuid.uuid4())  
         payload_dict = {'id': exec_id, 'code': code}
-        if tp == 'ext_ws': payload_dict['tabId'] = int(session.id)
+        if tp == 'ext_ws':
+            payload_dict['tabId'] = chrome_tab_id_of(session)
         payload = json.dumps(payload_dict)
 
         if tp in ['ws', 'ext_ws']: session.ws_client.send_message(payload)  
@@ -299,7 +367,29 @@ class TMWebDriver:
     def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
     def newtab(self, url=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
-        return self.execute_js(f'GM_openInTab("{url}");')
-    
+        # 优先走扩展 chrome.tabs.create。页面脚本没有用户手势时，popup blocker
+        # 会拦 window.open / 锚点；旧版 service worker 对 create 会回成标签列表，
+        # 用返回形状识别后降级到页面脚本。
+        try:
+            r = self.execute_js(
+                json.dumps({"cmd": "tabs", "method": "create", "url": url}), timeout=10)
+            data = r.get('data') if isinstance(r, dict) else r
+            if isinstance(data, dict) and data.get('id'):
+                return {'via': 'extension', **data}
+            _safe_print('tabs/create not supported by this service worker; using page script')
+        except Exception as exc:
+            _safe_print('tabs/create failed; using page script:', str(exc)[:120])
+        return self.execute_js(f'''
+            (function () {{
+                var w = window.open({json.dumps(url)}, "_blank");
+                if (w) return "window.open";
+                var a = document.createElement("a");
+                a.href = {json.dumps(url)}; a.target = "_blank"; a.rel = "noopener";
+                (document.body || document.documentElement).appendChild(a);
+                a.click(); a.remove();
+                return "anchor-click";
+            }})()
+        ''')
+
 if __name__ == "__main__":
     driver = TMWebDriver(host='127.0.0.1', port=18865)

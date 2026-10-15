@@ -1,50 +1,428 @@
 <!DOCTYPE html>
-<html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <style>
-body{width:420px;max-height:560px;margin:0;padding:8px;font:12px monospace;background:#1e1e1e;color:#d4d4d4;overflow-y:auto}
-h3{margin:4px 0;color:#569cd6}
-.row{margin-bottom:6px}
-.row label{display:block;color:#9cdcfe;margin-bottom:2px}
-input{width:100%;box-sizing:border-box;padding:4px 6px;border:1px solid #3c3c3c;border-radius:3px;background:#252526;color:#d4d4d4;font:inherit}
-button{background:#264f78;color:#fff;border:none;padding:4px 12px;cursor:pointer;border-radius:3px;margin-right:6px;margin-bottom:6px}
-button:hover{background:#37699e}
-.hint{font-size:11px;color:#858585;margin-top:4px}
-pre{white-space:pre-wrap;word-break:break-all;margin:0;padding:6px;background:#252526;border-radius:3px;max-height:280px;overflow-y:auto}
-hr{border:none;border-top:1px solid #3c3c3c;margin:10px 0}
-.conn-line{margin:6px 0;padding:8px 10px;border-radius:4px;font-weight:bold;line-height:1.35;white-space:pre-wrap}
-.conn-ok{background:#1a2e1a;color:#7ee787;border:1px solid #2f5a2f}
-.conn-warn{background:#2e2a12;color:#f5d742;border:1px solid #5a5418}
-.conn-bad{background:#2e1a1a;color:#ff9d9d;border:1px solid #5a2a2a}
-.conn-wait{background:#252526;color:#9cdcfe;border:1px solid #3c3c3c}
+  :root {
+    --text: #1a1d21;
+    --sub: #6b7280;
+    --line: #e8eaed;
+    --fill: #f5f6f8;
+    --primary: #2563eb;
+    --primary-h: #1d4ed8;
+    --ok: #059669;
+    --warn: #d97706;
+    --bad: #dc2626;
+    --font: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    --mono: "Cascadia Code", Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html {
+    scrollbar-width: thin;
+    scrollbar-color: #b8c0cc #eef1f5;
+  }
+  html::-webkit-scrollbar,
+  body::-webkit-scrollbar,
+  #out::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  html::-webkit-scrollbar-track,
+  body::-webkit-scrollbar-track,
+  #out::-webkit-scrollbar-track {
+    background: #eef1f5;
+    border-radius: 8px;
+  }
+  html::-webkit-scrollbar-thumb,
+  body::-webkit-scrollbar-thumb,
+  #out::-webkit-scrollbar-thumb {
+    background: #b8c0cc;
+    border-radius: 8px;
+    border: 2px solid #eef1f5;
+  }
+  html::-webkit-scrollbar-thumb:hover,
+  body::-webkit-scrollbar-thumb:hover,
+  #out::-webkit-scrollbar-thumb:hover {
+    background: #9aa3b2;
+  }
+
+  body {
+    width: 348px;
+    max-height: 580px;
+    padding: 0;
+    background: #fff;
+    font: 13px/1.45 var(--font);
+    color: var(--text);
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+  }
+
+  .shell {
+    background: #fff;
+  }
+
+  .hero {
+    padding: 14px 16px 12px;
+    background: #fff;
+    color: var(--text);
+    border-bottom: 1px solid var(--line);
+  }
+  .hero-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .hero-title {
+    font-size: 16px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+  }
+  .hero-tag {
+    font-size: 11px;
+    color: var(--sub);
+    margin-top: 2px;
+  }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 650;
+    background: var(--fill);
+    border: 1px solid var(--line);
+    color: var(--sub);
+  }
+  .chip .dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+  }
+  .chip.ok { color: var(--ok); background: #ecfdf5; border-color: #a7f3d0; }
+  .chip.warn { color: var(--warn); background: #fffbeb; border-color: #fde68a; }
+  .chip.bad { color: var(--bad); background: #fef2f2; border-color: #fecaca; }
+  .chip.wait { color: var(--sub); }
+  .chip.warn .dot { animation: pulse 1.2s ease infinite; }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+
+  .body { padding: 14px 16px 14px; }
+
+  .sec { margin-bottom: 14px; }
+  .sec:last-child { margin-bottom: 0; }
+  .sec-h {
+    margin-bottom: 8px;
+    font-size: 11px;
+    font-weight: 650;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--sub);
+  }
+
+  .field { margin-bottom: 8px; }
+  .field:last-child { margin-bottom: 0; }
+  .field label {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    color: #374151;
+  }
+  .row2 {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+  }
+  .row2 .btn { height: 40px; padding: 0 14px; }
+
+  input[type="text"],
+  input[type="number"] {
+    width: 100%;
+    height: 40px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--fill);
+    color: var(--text);
+    font: 13px/1 var(--font);
+    outline: none;
+    transition: border-color 0.15s, box-shadow 0.15s, background 0.15s;
+  }
+  input::placeholder { color: #94a3b8; }
+  input:focus {
+    background: #fff;
+    border-color: #93c5fd;
+    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+  }
+
+  .idline {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    height: 40px;
+    padding: 0 12px;
+    border: 1px dashed #d1d5db;
+    border-radius: 10px;
+    background: #fff;
+    cursor: pointer;
+    text-align: left;
+  }
+  .idline:hover {
+    border-color: #94a3b8;
+    background: var(--fill);
+  }
+  .idline code {
+    font: 12px/1.3 var(--mono);
+    color: var(--sub);
+    word-break: break-all;
+  }
+  .idline em {
+    flex-shrink: 0;
+    font-style: normal;
+    font-size: 11px;
+    font-weight: 650;
+    color: var(--primary);
+  }
+  .idline.copied em { color: var(--ok); }
+
+  .grid {
+    display: grid;
+    grid-template-columns: 1fr 84px;
+    gap: 8px;
+  }
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+  }
+
+  .inline {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 8px;
+  }
+  .check {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--sub);
+  }
+  .check input { accent-color: var(--primary); width: 15px; height: 15px; }
+
+  .btn {
+    appearance: none;
+    border: none;
+    border-radius: 10px;
+    cursor: pointer;
+    font: 650 12px/1 var(--font);
+    transition: transform 0.08s, filter 0.12s;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn.primary {
+    height: 36px;
+    padding: 0 16px;
+    background: var(--primary);
+    color: #fff;
+  }
+  .btn.primary:hover { background: var(--primary-h); }
+  .btn.ghost {
+    height: 36px;
+    padding: 0 12px;
+    background: var(--fill);
+    color: #4b5563;
+    border: 1px solid var(--line);
+  }
+  .btn.ghost:hover { background: #fff; border-color: #d1d5db; }
+  .btn.link {
+    height: auto;
+    padding: 0;
+    background: none;
+    color: var(--primary);
+    font-weight: 650;
+  }
+  .btn.link:hover { text-decoration: underline; }
+
+  .acts {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 10px;
+  }
+  .acts .primary { flex: 1; }
+
+  .endpoint {
+    margin-top: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: var(--fill);
+    font: 11px/1.35 var(--mono);
+    color: #4b5563;
+    word-break: break-all;
+  }
+  .detail, .hint {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--sub);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .hint { min-height: 15px; }
+  .hint.ok { color: var(--ok); }
+  .hint.bad { color: var(--bad); }
+
+  .cookie-box {
+    margin-top: 14px;
+    padding-top: 12px;
+    border-top: 1px solid var(--line);
+  }
+  .cookie-box > summary {
+    list-style: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    cursor: pointer;
+    user-select: none;
+    font-size: 12px;
+    font-weight: 650;
+    color: #374151;
+  }
+  .cookie-box > summary::-webkit-details-marker { display: none; }
+  .cookie-box > summary::after {
+    content: "展开";
+    font-size: 11px;
+    font-weight: 650;
+    color: var(--primary);
+  }
+  .cookie-box[open] > summary::after { content: "收起"; }
+  #cookieSummary {
+    flex: 1;
+    text-align: right;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--sub);
+  }
+  .cookie-inner { margin-top: 8px; }
+  .cookie-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  #out {
+    display: block;
+    max-height: 140px;
+    overflow: auto;
+    padding: 8px 10px 8px 8px;
+    border-radius: 8px;
+    background: var(--fill);
+    border: 1px solid var(--line);
+    font: 10px/1.45 var(--mono);
+    color: #4b5563;
+    white-space: pre-wrap;
+    word-break: break-all;
+    scrollbar-width: thin;
+    scrollbar-color: #b8c0cc #eef1f5;
+    scrollbar-gutter: stable;
+  }
+  #out:empty::before {
+    content: "展开后自动读取，或点刷新";
+    color: #94a3b8;
+    font-family: var(--font);
+    font-size: 11px;
+  }
+  #out:empty { min-height: 36px; }
+  #cookieHint {
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--sub);
+  }
 </style>
 </head>
-<body>
-<p class="hint" style="margin:0 0 8px 0">桥接地址在下方配置，保存后写入浏览器本地存储；<code>config.js</code> 仅为首次安装默认值，MCP 不会覆盖你的设置。</p>
-<h3>桥接地址</h3>
-<p id="tmwdConnStatus" class="conn-line conn-wait">正在读取连接状态…</p>
-<div class="row">
-  <label for="tmwdHost">主机（可填 wss://域名:端口）</label>
-  <input id="tmwdHost" type="text" placeholder="gac.fn.t8.ee 或 wss://gac.fn.t8.ee:83" autocomplete="off" />
-</div>
-<div class="row">
-  <label for="tmwdPort">端口（WSS 反代填对外端口，如 83）</label>
-  <input id="tmwdPort" type="number" min="1" max="65535" placeholder="83" />
-</div>
-<div class="row">
-  <label><input id="tmwdSecure" type="checkbox" /> 使用 WSS (TLS / 反代)</label>
-</div>
-<button type="button" id="tmwdSave">保存并重连</button>
-<button type="button" id="tmwdReset">恢复默认</button>
-<button type="button" id="tmwdRefreshConn">刷新连接状态</button>
-<p id="tmwdCfgHint" class="hint"></p>
+<body data-conn="wait">
+  <div class="shell">
+    <header class="hero">
+      <div class="hero-row">
+        <div>
+          <div class="hero-title">Agent Browser</div>
+          <div class="hero-tag">Chrome ↔ MCP 桥接</div>
+        </div>
+        <div id="connChip" class="chip wait"><span class="dot"></span><span id="connChipText">检测中</span></div>
+      </div>
+    </header>
 
-<hr />
+    <div class="body">
+      <section class="sec">
+        <div class="sec-h">浏览器身份</div>
+        <div class="field">
+          <label for="tmwdBrowserLabel">辨识名</label>
+          <div class="row2">
+            <input id="tmwdBrowserLabel" type="text" maxlength="32" placeholder="例如：卖家 Chrome" autocomplete="off" />
+            <button type="button" class="btn primary" id="tmwdBrowserSave">保存</button>
+          </div>
+        </div>
+        <div class="field">
+          <label>永久 ID</label>
+          <button type="button" class="idline" id="identId" title="点击复制">
+            <code id="identIdText">读取中</code>
+            <em id="identIdHint">复制</em>
+          </button>
+        </div>
+      </section>
 
-<h3>🍪 Cookies</h3>
-<button id="refresh">刷新</button>
-<pre id="out">点击刷新获取 cookies...</pre>
-<script src="popup.js"></script>
+      <section class="sec">
+        <div class="sec-h">桥接</div>
+        <div class="grid">
+          <div class="field">
+            <label for="tmwdHost">主机</label>
+            <input id="tmwdHost" type="text" placeholder="127.0.0.1" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="tmwdPort">端口</label>
+            <input id="tmwdPort" type="number" min="1" max="65535" placeholder="18865" />
+          </div>
+        </div>
+        <div class="inline">
+          <label class="check"><input id="tmwdSecure" type="checkbox" /> 使用 WSS</label>
+        </div>
+        <div class="acts">
+          <button type="button" class="btn primary" id="tmwdSave">保存并重连</button>
+          <button type="button" class="btn ghost" id="tmwdRefreshConn">刷新</button>
+          <button type="button" class="btn ghost" id="tmwdReset">默认</button>
+        </div>
+        <div id="connUrl" class="endpoint">ws://…</div>
+        <div id="connDetail" class="detail"></div>
+        <p id="tmwdCfgHint" class="hint"></p>
+      </section>
+
+      <details class="cookie-box" id="cookiePanel">
+        <summary>当前页 Cookies <span id="cookieSummary"></span></summary>
+        <div class="cookie-inner">
+          <div class="cookie-actions">
+            <button type="button" class="btn ghost" id="cookieReload">刷新</button>
+            <button type="button" class="btn link" id="refresh">复制</button>
+          </div>
+          <pre id="out"></pre>
+          <p id="cookieHint" class="hint">展开只读取展示，不会自动复制</p>
+        </div>
+      </details>
+    </div>
+  </div>
+  <script src="popup.js"></script>
 </body>
 </html>

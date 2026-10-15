@@ -23,6 +23,65 @@ const TMWD_DEFAULT_WS_URL =
 const TMWD_STORAGE_HOST = 'tmwd_bridge_host';
 const TMWD_STORAGE_PORT = 'tmwd_bridge_port';
 const TMWD_STORAGE_SECURE = 'tmwd_bridge_secure';
+const TMWD_STORAGE_BROWSER_LABEL = 'tmwd_browser_label';
+const TMWD_STORAGE_BROWSER_ID = 'tmwd_browser_id';
+
+/** 生成一次、永不覆盖的浏览器指纹（绑定本 Chrome/Edge 配置的扩展本地存储）。 */
+function generateBrowserId() {
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto && crypto.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = (Math.random() * 256) | 0;
+  }
+  return (
+    'b_' +
+    Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  );
+}
+
+function isStableBrowserId(id) {
+  return typeof id === 'string' && /^b_[0-9a-f]{16,}$/i.test(id);
+}
+
+/**
+ * 每个浏览器配置一份稳定 id + 用户可改的辨识名。
+ * id 写入 chrome.storage.local：关浏览器 / 重启 / 重载扩展都保持不变；
+ * 只有卸载扩展或清站点数据才会丢（会重新生成）。
+ * @returns {Promise<{id: string, label: string, display: string, persisted: boolean}>}
+ */
+async function loadBrowserIdentity() {
+  const stored = await chrome.storage.local.get([
+    TMWD_STORAGE_BROWSER_LABEL,
+    TMWD_STORAGE_BROWSER_ID,
+  ]);
+  let id = stored[TMWD_STORAGE_BROWSER_ID];
+  let persisted = true;
+  // 兼容旧版短 id（b + 8 位），继续沿用，绝不擅自换新
+  const legacyOk = typeof id === 'string' && /^b[a-z0-9_]{6,}$/i.test(id);
+  if (!isStableBrowserId(id) && !legacyOk) {
+    id = generateBrowserId();
+    await chrome.storage.local.set({ [TMWD_STORAGE_BROWSER_ID]: id });
+    persisted = false;
+  }
+  const label =
+    typeof stored[TMWD_STORAGE_BROWSER_LABEL] === 'string'
+      ? stored[TMWD_STORAGE_BROWSER_LABEL].trim()
+      : '';
+  const display = label || `浏览器-${String(id).slice(-4)}`;
+  return { id, label, display, persisted: persisted || legacyOk || isStableBrowserId(id) };
+}
+
+/** 工具栏图标不挂辨识名；悬停标题仍带名字，方便多开时区分。 */
+async function refreshBrowserBadge() {
+  try {
+    const ident = await loadBrowserIdentity();
+    await chrome.action.setBadgeText({ text: '' });
+    await chrome.action.setTitle({
+      title: `Agent Browser Bridge｜${ident.display}`,
+    });
+  } catch (_) {}
+}
 
 function tmwdParseWsUrl(input) {
   const raw = String(input || '').trim();
@@ -244,6 +303,22 @@ async function cdpFileChooserFill(msg) {
 }
 
 async function handleExtMessage(msg, sender) {
+  if (msg.cmd === 'tmwd_browser_get') {
+    const ident = await loadBrowserIdentity();
+    return { ok: true, ...ident };
+  }
+  if (msg.cmd === 'tmwd_browser_set') {
+    const label = msg.label !== undefined && msg.label !== null ? String(msg.label).trim() : '';
+    if (!label) {
+      await chrome.storage.local.remove([TMWD_STORAGE_BROWSER_LABEL]);
+    } else {
+      await chrome.storage.local.set({ [TMWD_STORAGE_BROWSER_LABEL]: label.slice(0, 32) });
+    }
+    await refreshBrowserBadge();
+    await sendTabsUpdate();
+    const ident = await loadBrowserIdentity();
+    return { ok: true, ...ident };
+  }
   if (msg.cmd === 'tmwd_bridge_get') {
     const stored = await chrome.storage.local.get([
       TMWD_STORAGE_HOST,
@@ -251,6 +326,7 @@ async function handleExtMessage(msg, sender) {
       TMWD_STORAGE_SECURE,
     ]);
     const effective = await loadBridgeEndpoint();
+    const browser = await loadBrowserIdentity();
     return {
       ok: true,
       defaults: {
@@ -265,6 +341,7 @@ async function handleExtMessage(msg, sender) {
         secure: stored[TMWD_STORAGE_SECURE] ?? null,
       },
       effective,
+      browser,
     };
   }
   if (msg.cmd === 'tmwd_bridge_set') {
@@ -317,6 +394,7 @@ async function handleExtMessage(msg, sender) {
     if (rs === WebSocket.OPEN) phase = 'connected';
     else if (rs === WebSocket.CONNECTING) phase = 'connecting';
     else if (rs === WebSocket.CLOSING) phase = 'closing';
+    const browser = await loadBrowserIdentity();
     return {
       ok: true,
       effective: ep,
@@ -327,6 +405,7 @@ async function handleExtMessage(msg, sender) {
       skipHttpProbe: ep.skipHttpProbe,
       lastClose: { ...tmwdCloseInfo },
       lastError: tmwdLastError || '',
+      browser,
     };
   }
   if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
@@ -339,6 +418,17 @@ async function handleExtMessage(msg, sender) {
         const tab = await chrome.tabs.update(msg.tabId, { active: true });
         await chrome.windows.update(tab.windowId, { focused: true });
         return { ok: true };
+      } else if (msg.method === 'create') {
+        // 扩展侧开页可绕过 popup blocker：页面注入脚本没有用户手势，
+        // window.open / 锚点点击在多数站点会被拦，chrome.tabs.create 不受影响。
+        const tab = await chrome.tabs.create({ url: msg.url, active: msg.active !== false });
+        return { ok: true, data: { id: tab.id, url: tab.url, title: tab.title } };
+      } else if (msg.method === 'close') {
+        const ids = (Array.isArray(msg.tabIds) ? msg.tabIds : [msg.tabId])
+          .filter((id) => typeof id === 'number');
+        if (!ids.length) return { ok: false, error: 'no tab ids to close' };
+        await chrome.tabs.remove(ids);
+        return { ok: true, closed: ids };
       } else {
         const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
         const data = tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId }));
@@ -377,11 +467,65 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 async function handleCookies(msg, sender) {
   try {
+    // method: get(default) | set | clear
+    const method = msg.method || 'get';
+    if (method === 'set') {
+      const list = Array.isArray(msg.cookies) ? msg.cookies : [];
+      const results = [];
+      for (const c of list) {
+        if (!c || !c.name) {
+          results.push({ ok: false, error: 'missing name' });
+          continue;
+        }
+        const domain = c.domain || '';
+        const host = domain.replace(/^\./, '') || 'ozon.ru';
+        const url =
+          c.url ||
+          (c.secure === false ? `http://${host}/` : `https://${host}/`);
+        const details = {
+          url,
+          name: c.name,
+          value: c.value == null ? '' : String(c.value),
+          path: c.path || '/',
+          secure: !!c.secure,
+          httpOnly: !!c.httpOnly,
+        };
+        if (domain) details.domain = domain;
+        if (c.expirationDate != null && Number.isFinite(Number(c.expirationDate))) {
+          details.expirationDate = Number(c.expirationDate);
+        }
+        const ss = c.sameSite;
+        if (ss && ss !== 'unspecified') details.sameSite = ss;
+        if (c.partitionKey && typeof c.partitionKey === 'object') {
+          details.partitionKey = c.partitionKey;
+        }
+        try {
+          const saved = await chrome.cookies.set(details);
+          results.push({
+            ok: !!saved,
+            name: c.name,
+            domain: domain || null,
+            error: saved ? null : 'chrome.cookies.set returned null',
+          });
+        } catch (e) {
+          results.push({
+            ok: false,
+            name: c.name,
+            domain: domain || null,
+            error: e.message || String(e),
+          });
+        }
+      }
+      const okCount = results.filter((r) => r.ok).length;
+      return { ok: true, data: { set: okCount, total: list.length, results } };
+    }
+
     let url = msg.url || sender.tab?.url;
     if (!url && msg.tabId) {
       const tab = await chrome.tabs.get(msg.tabId);
       url = tab.url;
     }
+    if (!url) return { ok: false, error: 'no url for cookies' };
     const origin = url.match(/^https?:\/\/[^\/]+/)[0];
     const all = await chrome.cookies.getAll({ url });
     const part = await chrome.cookies.getAll({ url, partitionKey: { topLevelSite: origin } }).catch(() => []);
@@ -651,12 +795,8 @@ async function connectWS() {
     tmwdCloseInfo = { code: 0, reason: '', wasClean: true };
     console.log('[TMWD-WS] Connected!');
     scheduleKeepalive(); // Keep SW alive while connected
-    const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
-    ws.send(JSON.stringify({
-      type: 'ext_ready',
-      tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
-    }));
-    console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs');
+    await refreshBrowserBadge();
+    await sendTabsUpdate('ext_ready');
   };
   ws.onmessage = async (event) => {
     try {
@@ -710,6 +850,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 void (async () => {
   try {
+    await refreshBrowserBadge();
     await connectWS();
   } catch (e) {
     console.error('[TMWD-WS] initial connect', e);
@@ -717,20 +858,35 @@ void (async () => {
   }
 })();
 chrome.runtime.onStartup.addListener(() => {
+  void refreshBrowserBadge();
   void connectWS().catch(() => scheduleProbe());
 });
 chrome.runtime.onInstalled.addListener(() => {
+  void refreshBrowserBadge();
   void connectWS().catch(() => scheduleProbe());
 });
 
-// Sync tab list on changes
-async function sendTabsUpdate() {
+// Sync tab list on changes（附带浏览器辨识，供 Agent 区分多浏览器）
+async function sendTabsUpdate(type = 'tabs_update') {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url) && !/streamlit/i.test(t.title));
-  ws.send(JSON.stringify({
-    type: 'tabs_update',
-    tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
-  }));
+  const browser = await loadBrowserIdentity();
+  const tabs = (await chrome.tabs.query({})).filter(
+    (t) => isScriptable(t.url) && !/streamlit/i.test(t.title || '')
+  );
+  ws.send(
+    JSON.stringify({
+      type,
+      browser: { id: browser.id, label: browser.display },
+      tabs: tabs.map((t) => ({
+        id: t.id,
+        url: t.url,
+        title: t.title,
+        browser_id: browser.id,
+        browser_label: browser.display,
+      })),
+    })
+  );
+  console.log('[TMWD-WS] Sent', type, 'browser=', browser.display, 'tabs=', tabs.length);
 }
 chrome.tabs.onUpdated.addListener((_, changeInfo) => {
   if (changeInfo.status === 'complete') sendTabsUpdate();
