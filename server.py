@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 os.environ.setdefault("PYAUTO_GUI_NO_FAILSAFE", "1")
 
-from mcp.server.mcpserver import MCPServer
+from mcp.server.fastmcp import FastMCP
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -23,7 +23,7 @@ from tmwebdriver import TMWebDriver  # noqa: E402
 import simphtml  # noqa: E402
 import semantic  # noqa: E402
 
-mcp = MCPServer(
+mcp = FastMCP(
     name="agent-browser",
     instructions=(
         "Browser automation tools for the user's real Chrome session via TMWebDriver/CDP bridge. "
