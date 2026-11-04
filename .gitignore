@@ -6,3 +6,5 @@ dist/
 build/
 temp_desktop.png
 .cursor/
+_restart*.log
+chrome_extension.zip
