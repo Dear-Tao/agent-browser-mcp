@@ -144,23 +144,46 @@ window.__abrt = (function () {
     if (m.type) o.type = m.type;
     if (m.placeholder) o.placeholder = m.placeholder;
     if (m.testId) o.testId = m.testId;
+    // 元素位于 iframe 内时标记，方便 agent 意识到上下文
+    if (el.ownerDocument && el.ownerDocument !== document) o.iframe = true;
     return o;
+  }
+
+  function sameOriginDocs() {
+    // 主文档 + 全部可访问的同源 iframe/frame 文档（深度<=3）
+    var docs = [];
+    function walk(doc, depth) {
+      if (!doc || depth > 3) return;
+      docs.push(doc);
+      var fr = doc.querySelectorAll('iframe,frame');
+      for (var i = 0; i < fr.length; i++) {
+        var cd = null;
+        try { cd = fr[i].contentDocument; } catch (e) { cd = null; }
+        if (cd) walk(cd, depth + 1);
+      }
+    }
+    walk(document, 0);
+    return docs;
   }
 
   function collect(opts) {
     var o = opts || {};
-    var root = document.body || document.documentElement;
-    if (!root) return [];
-    var list;
-    try { list = Array.from(root.querySelectorAll(o.interactiveOnly === false ? '*' : RE_INT)); }
-    catch (e) { return []; }
+    var docs = sameOriginDocs();
     var out = [], cap = o.scanLimit || 3000;
-    for (var i = 0; i < list.length && out.length < cap; i++) {
-      var el = list[i];
-      var role = roleOf(el);
-      if (o.interactiveOnly !== false && !role) continue;
-      if (!isVisible(el)) continue;
-      out.push({ el: el, role: role, name: nameOf(el) });
+    for (var d = 0; d < docs.length && out.length < cap; d++) {
+      var doc = docs[d];
+      var root = doc.body || doc.documentElement;
+      if (!root) continue;
+      var list;
+      try { list = Array.from(root.querySelectorAll(o.interactiveOnly === false ? '*' : RE_INT)); }
+      catch (e) { continue; }
+      for (var i = 0; i < list.length && out.length < cap; i++) {
+        var el = list[i];
+        var role = roleOf(el);
+        if (o.interactiveOnly !== false && !role) continue;
+        if (!isVisible(el)) continue;
+        out.push({ el: el, role: role, name: nameOf(el) });
+      }
     }
     return out;
   }
@@ -325,12 +348,60 @@ window.__abrt = (function () {
     var r = reg(), n = 0;
     for (var k in r) { if (Object.prototype.hasOwnProperty.call(r, k)) n++; }
     return { ok: true, docId: docId(), url: location.href, title: document.title,
-             readyState: document.readyState, liveRefs: n };
+             readyState: document.readyState, liveRefs: n,
+             frames: sameOriginDocs().length };
+  }
+
+  // 批量动作链：依序执行多个 act，遇到第一个失败/文档切换即停止（已执行的不回滚）
+  function actMany(spec) {
+    var s = spec || {};
+    var actions = s.actions || [];
+    var expectDocId = (s.opts && s.opts.expectDocId) || '';
+    var out = [], executed = 0, stopped = false, stopReason = null;
+    for (var i = 0; i < actions.length; i++) {
+      var a = actions[i] || {};
+      var r = act({ ref: a.ref, action: a.action, value: a.value, opts: { expectDocId: expectDocId } });
+      var row = { step: i, ref: a.ref, action: a.action, ok: !!r.ok, status: r.status };
+      if (r.reason) row.reason = r.reason;
+      out.push(row);
+      if (r.ok && r.status === 'ok') { executed++; continue; }
+      stopped = true; stopReason = r.reason || r.status; break;
+    }
+    return { ok: true, status: stopped ? 'partial' : 'ok', executed: executed,
+             stopped: stopped, stopReason: stopReason, docId: docId(), results: out };
+  }
+
+  // 轮询等待条件：selector / selector_exists / ref / url_contains / title_contains / text / idle
+  function waitFor(spec) {
+    var s = spec || {};
+    var kind = s.kind, val = s.value || '';
+    var timeout = Math.max(0.5, Math.min(Number(s.timeout) || 10, 60)) * 1000;
+    var start = Date.now(), lastErr = null;
+    return new Promise(function (resolve) {
+      function check() {
+        var ok = false;
+        try {
+          if (kind === 'selector') { var el = document.querySelector(val); ok = !!el && isVisible(el); }
+          else if (kind === 'selector_exists') { ok = !!document.querySelector(val); }
+          else if (kind === 'ref') { var r0 = reg()[val]; ok = !!(r0 && r0.isConnected); }
+          else if (kind === 'url_contains') { ok = location.href.indexOf(val) !== -1; }
+          else if (kind === 'title_contains') { ok = document.title.indexOf(val) !== -1; }
+          else if (kind === 'text') { ok = !!(document.body && document.body.innerText && document.body.innerText.indexOf(val) !== -1); }
+          else if (kind === 'idle') { ok = document.readyState === 'complete'; }
+          else { resolve({ ok: false, reason: 'UNKNOWN_KIND', kind: kind }); return; }
+        } catch (e) { lastErr = String((e && e.message) || e); }
+        var waited = Date.now() - start;
+        if (ok) { resolve({ ok: true, met: true, waited_ms: waited, url: location.href }); return; }
+        if (waited >= timeout) { resolve({ ok: true, met: false, reason: 'TIMEOUT', waited_ms: waited, url: location.href, last_error: lastErr }); return; }
+        setTimeout(check, 250);
+      }
+      check();
+    });
   }
 
   return {
     v: V, docId: docId, state: state, snapshot: snapshot, find: find,
-    act: act, store: store, meta: function (el) {
+    act: act, actMany: actMany, waitFor: waitFor, store: store, meta: function (el) {
       var m = metaOf(el);
       m.visible = isVisible(el);
       return m;
@@ -496,3 +567,150 @@ def element_action(
             {"ref": ref, "action": action, "value": value, "opts": {"expectDocId": expect_doc_id}},
         ),
     )
+
+
+def element_action_batch(
+    driver,
+    actions: list[dict[str, Any]],
+    expect_doc_id: str = "",
+) -> dict[str, Any]:
+    return _unwrap(
+        driver,
+        _snippet(
+            "actMany",
+            {"actions": actions, "opts": {"expectDocId": expect_doc_id}},
+        ),
+    )
+
+
+def wait_for(
+    driver,
+    kind: str,
+    value: str = "",
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    # 桥接超时必须大于页面侧轮询超时，否则先收到 bridge 超时
+    return _unwrap(
+        driver,
+        _snippet("waitFor", {"kind": kind, "value": value, "timeout": timeout}),
+        timeout=timeout + 10.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 控制台 / 网络捕获运行时：首次调用时在页面 MAIN world 安装钩子（版本门控），
+# 之后在同一文档内持续采集，随导航自动清零。fetch/XHR 响应体截断到 2KB。
+# ---------------------------------------------------------------------------
+_MONITOR_JS = r"""
+window.__abmon = (function () {
+  var V = 1;
+  if (window.__abmon && window.__abmon.v === V) return window.__abmon;
+  var CONSOLE_MAX = 100, NET_MAX = 80, BODY_MAX = 2000, TEXT_MAX = 1000;
+  var con = [], net = [], seq = 0;
+  if (!window.__abmon_installed) {
+    window.__abmon_installed = true;
+    ['log', 'info', 'warn', 'error', 'debug'].forEach(function (lv) {
+      var orig = console[lv] ? console[lv].bind(console) : function () {};
+      console[lv] = function () {
+        try {
+          var parts = [];
+          for (var i = 0; i < arguments.length; i++) {
+            var a = arguments[i];
+            if (typeof a === 'string') parts.push(a);
+            else {
+              try { parts.push(JSON.stringify(a, function (k, v) { return v instanceof Error ? String(v) : v; })); }
+              catch (e2) { parts.push(String(a)); }
+            }
+          }
+          con.push({ seq: ++seq, ts: Date.now(), level: lv, text: parts.join(' ').slice(0, TEXT_MAX) });
+          if (con.length > CONSOLE_MAX) con.shift();
+        } catch (e) {}
+        return orig.apply(null, arguments);
+      };
+    });
+    window.addEventListener('error', function (e) {
+      con.push({ seq: ++seq, ts: Date.now(), level: 'error',
+                 text: ('[window.onerror] ' + (e.message || '') + ' @' + (e.filename || '') + ':' + (e.lineno || '')).slice(0, TEXT_MAX) });
+      if (con.length > CONSOLE_MAX) con.shift();
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var r = e.reason;
+      con.push({ seq: ++seq, ts: Date.now(), level: 'error',
+                 text: ('[unhandledrejection] ' + (r && (r.stack || r.message) || String(r))).slice(0, TEXT_MAX) });
+      if (con.length > CONSOLE_MAX) con.shift();
+    });
+    if (!window.__ab_fetch_orig) {
+      window.__ab_fetch_orig = window.fetch;
+      window.fetch = function () {
+        var arg0 = arguments[0];
+        var url = (arg0 && arg0.url) || arg0 || '';
+        var method = (arg0 && arg0.method) || (arguments[1] && arguments[1].method) || 'GET';
+        var entry = { seq: ++seq, ts: Date.now(), type: 'fetch', method: String(method), url: String(url).slice(0, 500) };
+        net.push(entry); if (net.length > NET_MAX) net.shift();
+        var mySeq = entry.seq;
+        return window.__ab_fetch_orig.apply(this, arguments).then(function (resp) {
+          try {
+            var e2 = null;
+            for (var i = 0; i < net.length; i++) if (net[i].seq === mySeq) e2 = net[i];
+            if (e2) {
+              e2.status = resp.status; e2.ok = resp.ok;
+              resp.clone().text().then(function (t) { e2.body = String(t).slice(0, BODY_MAX); }).catch(function () {});
+            }
+          } catch (e) {}
+          return resp;
+        });
+      };
+      var xo = XMLHttpRequest.prototype.open, xs = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function (m, u) {
+        this.__abm = { seq: ++seq, ts: Date.now(), type: 'xhr', method: String(m), url: String(u).slice(0, 500) };
+        return xo.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function () {
+        var self = this, e = self.__abm;
+        if (e) { net.push(e); if (net.length > NET_MAX) net.shift(); }
+        this.addEventListener('load', function () {
+          if (!e) return;
+          e.status = self.status; e.ok = self.status >= 200 && self.status < 300;
+          try { var rt = self.responseType; if (!rt || rt === 'text') e.body = String(self.responseText || '').slice(0, BODY_MAX); } catch (_) {}
+        });
+        return xs.apply(this, arguments);
+      };
+    }
+  }
+  function since(arr, s) {
+    var out = [];
+    for (var i = 0; i < arr.length; i++) if (!s || arr[i].seq > s) out.push(arr[i]);
+    return out;
+  }
+  return {
+    v: V,
+    consoleLog: function (spec) {
+      var s = spec || {};
+      var lv = (s.level || '').toLowerCase();
+      var en = since(con, s.since || 0);
+      if (lv) en = en.filter(function (e) { return e.level === lv; });
+      return { ok: true, entries: en, buffered: con.length, docId: (window.__ab_doc_id || null) };
+    },
+    networkLog: function (spec) {
+      var s = spec || {};
+      var u = (s.url_filter || '').toLowerCase();
+      var en = since(net, s.since || 0);
+      if (u) en = en.filter(function (e) { return (e.url || '').toLowerCase().indexOf(u) !== -1; });
+      return { ok: true, entries: en, buffered: net.length, docId: (window.__ab_doc_id || null) };
+    }
+  };
+})();
+"""
+
+
+def _monitor_snippet(call: str, config: Optional[dict] = None) -> str:
+    cfg = json.dumps(config or {}, ensure_ascii=False)
+    return _MONITOR_JS + "\nreturn window.__abmon." + call + "(" + cfg + ");\n"
+
+
+def console_log(driver, level: str = "", since_seq: int = 0) -> dict[str, Any]:
+    return _unwrap(driver, _monitor_snippet("consoleLog", {"level": level, "since": since_seq}))
+
+
+def network_log(driver, url_filter: str = "", since_seq: int = 0) -> dict[str, Any]:
+    return _unwrap(driver, _monitor_snippet("networkLog", {"url_filter": url_filter, "since": since_seq}))

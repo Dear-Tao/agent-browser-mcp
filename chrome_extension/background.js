@@ -436,6 +436,18 @@ async function handleExtMessage(msg, sender) {
       }
     } catch (e) { return { ok: false, error: e.message }; }
   }
+  if (msg.cmd === 'downloads') {
+    try {
+      const q = { limit: Number(msg.limit) || 20, orderBy: ['-startTime'] };
+      if (msg.state) q.state = msg.state;
+      const items = await chrome.downloads.search(q);
+      return { ok: true, data: items.map(d => ({
+        id: d.id, filename: d.filename, url: d.url, state: d.state, mime: d.mime,
+        bytes: d.bytesReceived, total: d.totalBytes, started: d.startTime,
+        ended: d.endTime || undefined, error: d.error || undefined,
+      })) };
+    } catch (e) { return { ok: false, error: e.message }; }
+  }
   if (msg.cmd === 'management') {
     try {
       if (msg.method === 'list') {
@@ -873,23 +885,43 @@ async function sendTabsUpdate(type = 'tabs_update') {
   const tabs = (await chrome.tabs.query({})).filter(
     (t) => isScriptable(t.url) && !/streamlit/i.test(t.title || '')
   );
+  // 用户"正在看"的标签 = 最后聚焦窗口里的激活标签
+  let activeTabId = null;
+  let windowFocused = false;
+  try {
+    const [focused] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    if (focused) activeTabId = focused.id;
+    // 该浏览器是否真正持有系统焦点（多 Profile 时只有真正聚焦的那个可信）
+    const fw = await chrome.windows.getLastFocused();
+    windowFocused = !!fw.focused;
+  } catch (e) { /* 无聚焦窗口（如 Chrome 最小化）时保持默认值 */ }
   ws.send(
     JSON.stringify({
       type,
       browser: { id: browser.id, label: browser.display },
+      active_tab_id: activeTabId,
+      focused: windowFocused,
       tabs: tabs.map((t) => ({
         id: t.id,
         url: t.url,
         title: t.title,
+        active: !!t.active,
+        windowId: t.windowId,
         browser_id: browser.id,
         browser_label: browser.display,
       })),
     })
   );
-  console.log('[TMWD-WS] Sent', type, 'browser=', browser.display, 'tabs=', tabs.length);
+  console.log('[TMWD-WS] Sent', type, 'browser=', browser.display, 'tabs=', tabs.length, 'active=', activeTabId);
 }
 chrome.tabs.onUpdated.addListener((_, changeInfo) => {
   if (changeInfo.status === 'complete') sendTabsUpdate();
 });
 chrome.tabs.onRemoved.addListener(() => sendTabsUpdate());
 chrome.tabs.onCreated.addListener(() => sendTabsUpdate());
+// 用户切换标签页/窗口时立即推送，服务端才能实时跟踪"当前打开的是哪个标签"
+chrome.tabs.onActivated.addListener(() => sendTabsUpdate());
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  // windowId === -1 表示焦点离开所有 Chrome 窗口，此时不用推送
+  if (windowId !== chrome.windows.WINDOW_ID_NONE) sendTabsUpdate();
+});

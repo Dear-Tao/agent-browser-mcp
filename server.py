@@ -3,17 +3,21 @@ from __future__ import annotations
 import base64
 import json
 import os
-import random
-import re
 import socket
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
 os.environ.setdefault("PYAUTO_GUI_NO_FAILSAFE", "1")
 
-from mcp.server.mcpserver import MCPServer
+try:
+    # mcp 1.x
+    from mcp.server.fastmcp import FastMCP as MCPServer
+except ImportError:
+    # mcp 2.x: FastMCP was renamed to MCPServer
+    from mcp.server.mcpserver import MCPServer
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -31,6 +35,21 @@ mcp = MCPServer(
         "Multi-browser: the user names each browser in the extension popup (browser_label). "
         "When they say which browser to use, call switch_browser(browser_label=...). "
         "You pick any live tab inside that browser yourself — do not ask the user for tab ids.\n\n"
+        "User's current tab: get_active_tab() returns the tab the user is actually looking at "
+        "(active tab of the last focused window). list_tabs() also marks each tab with "
+        "is_active_tab. When the user says '当前页面/现在打开的' — use get_active_tab(), "
+        "do NOT guess from default_session_id (which is just the first connected tab).\n\n"
+        "Tab reuse: open_url(reuse='auto', default) reuses an already-open matching tab "
+        "(switches to it and focuses the browser window) instead of creating duplicates; "
+        "use reuse='new' to force a new tab or reuse='current' to force in-place navigation.\n\n"
+        "Efficiency: element_action_batch(actions_json) runs several actions in one call and "
+        "stops at the first failure. wait_for(kind, value) polls in-page (selector/ref/"
+        "url_contains/title_contains/text/idle) — prefer it over blind sleeps after clicks. "
+        "page_snapshot/find_element cover same-origin iframes too (iframe:true marks those "
+        "elements). file_upload(click_selector, files_csv) fills file-chooser dialogs via CDP. "
+        "console_log / network_log read captured console output and fetch/XHR traffic "
+        "(hooks install on first call; network_log returns JSON bodies up to 2KB — prefer it "
+        "over DOM parsing for API-driven pages). downloads_list lists browser downloads.\n\n"
         "Preferred flow for interacting with a page (avoids inventing CSS selectors each time):\n"
         "  1. page_snapshot()  -> interactive elements as {ref, role, name, tag}, plus a docId.\n"
         "  2. element_action(ref='e7', action='click') to act on one.\n"
@@ -78,7 +97,6 @@ def detect_lan_ip() -> str:
         return "127.0.0.1"
 
 _CONFIG_JS_DEFAULTS = (
-    'const TID = \'{tid}\';\n'
     'var TMWD_HOST = "127.0.0.1";\n'
     'var TMWD_PORT = 18865;\n'
     'var TMWD_SECURE = false;\n'
@@ -92,14 +110,7 @@ def chrome_extension_dir() -> Path:
 def ensure_config_js() -> Path:
     path = chrome_extension_dir() / "config.js"
     if not path.exists():
-        tid = f"__ljq_{hex(random.randint(0, 99999999))[2:8]}"
-        path.write_text(_CONFIG_JS_DEFAULTS.format(tid=tid), encoding="utf-8")
-        return path
-    prev = path.read_text(encoding="utf-8")
-    if re.search(r"const\s+TID\s*=", prev):
-        return path
-    tid = f"__ljq_{hex(random.randint(0, 99999999))[2:8]}"
-    path.write_text(_CONFIG_JS_DEFAULTS.format(tid=tid), encoding="utf-8")
+        path.write_text(_CONFIG_JS_DEFAULTS, encoding="utf-8")
     return path
 
 
@@ -263,8 +274,37 @@ def list_tabs() -> dict[str, Any]:
             entry["sample_urls"].append(url)
     return {
         "default_session_id": require_driver().default_session_id,
+        "user_active_session_id": _user_active_session_id(),
         "browsers": list(browsers.values()),
         "tabs": sessions,
+    }
+
+
+def _user_active_session_id() -> Optional[str]:
+    """用户当前正在看的标签（最后聚焦窗口的激活标签），找不到返回 None。"""
+    for s in active_sessions():
+        if s.get("is_active_tab"):
+            return str(s.get("id"))
+    return None
+
+
+@mcp.tool(description=(
+    "Get the tab the user is currently looking at (the active tab of the last focused "
+    "browser window). Returns {session_id, url, title, browser_label} or {active: False} "
+    "if Chrome has no focused window or the active tab is not scriptable/connected."
+))
+def get_active_tab() -> dict[str, Any]:
+    sessions = active_sessions()
+    pick = next((s for s in sessions if s.get("is_active_tab")), None)
+    if not pick:
+        return {"active": False, "note": "Chrome 无聚焦窗口或激活标签页不可注入（如 chrome:// 页）"}
+    return {
+        "active": True,
+        "session_id": str(pick.get("id")),
+        "url": pick.get("url"),
+        "title": pick.get("title"),
+        "browser_label": pick.get("browser_label"),
+        "browser_id": pick.get("browser_id"),
     }
 
 
@@ -312,14 +352,94 @@ def switch_tab(
     return {"active_session_id": sid, "tabs": compact_tabs()}
 
 
-@mcp.tool(description="Navigate the current tab to a URL using real-browser JS navigation.")
-def open_url(url: str, session_id: Optional[str] = None, timeout: float = 15.0) -> dict[str, Any]:
+def _url_matches(a: str, b: str) -> bool:
+    """同一个页面才复用：同源 + 路径完全一致 + query 一致（忽略 fragment 和尾部 /）。
+
+    故意不做路径前缀匹配：开着 /orders/123 时请求 /orders 应该导航到列表页，
+    而不是被误判为"已打开"后切到详情页。
+    """
+    try:
+        pa, pb = urllib.parse.urlsplit(a), urllib.parse.urlsplit(b)
+    except ValueError:
+        return False
+    if (pa.scheme, pa.netloc) != (pb.scheme, pb.netloc) or not pa.netloc:
+        return False
+    ta = (pa.path or "/").rstrip("/") or "/"
+    tb = (pb.path or "/").rstrip("/") or "/"
+    if ta != tb:
+        return False
+    qa = sorted(urllib.parse.parse_qsl(pa.query))
+    qb = sorted(urllib.parse.parse_qsl(pb.query))
+    return qa == qb
+
+
+@mcp.tool(description=(
+    "Navigate to a URL. reuse='auto' (default): if a connected tab already shows the exact "
+    "same page (same origin, path and query), switch to it and focus it in the browser "
+    "instead of navigating — avoids duplicate tabs; falls back to navigating the "
+    "current/default tab when no match exists (an explicit session_id skips reuse and "
+    "navigates that session). reuse='current': always navigate the current/default tab "
+    "(use to force reload a reused page). reuse='new': always open a brand-new tab."
+))
+def open_url(
+    url: str,
+    session_id: Optional[str] = None,
+    timeout: float = 15.0,
+    reuse: str = "auto",
+) -> dict[str, Any]:
+    url = str(url or "").strip()
+    mode = (str(reuse or "auto") or "auto").strip().lower()
+    if mode not in ("auto", "new", "current"):
+        raise RuntimeError("reuse must be one of: auto, new, current")
+    # 显式指定 session_id = agent 明确知道要操作哪个标签，跳过复用逻辑
+    if session_id is not None and mode == "auto":
+        mode = "current"
+    driver = require_driver()
+    if mode == "new":
+        result = driver.newtab(url)
+        via = result.get("via") if isinstance(result, dict) else None
+        return {"status": "opened_new_tab", "url": url, "via": via}
+    if mode == "auto":
+        candidates = [
+            s for s in active_sessions()
+            if s.get("url") and _url_matches(str(s.get("url")), url)
+        ]
+        if candidates:
+            # 优先用户正在看的标签，其次最近连接的
+            candidates.sort(key=lambda s: (
+                not s.get("is_active_tab"),
+                -float(s.get("connected_at") or 0),
+            ))
+            pick = candidates[0]
+            sid = str(pick.get("id"))
+            driver.default_session_id = sid
+            # 把浏览器窗口真正聚焦到该标签（经由同一浏览器的会话发命令）
+            tid = pick.get("tab_id")
+            focused = False
+            if tid is not None:
+                same_browser = next(
+                    (
+                        s for s in active_sessions()
+                        if s.get("browser_id") == pick.get("browser_id")
+                    ),
+                    None,
+                )
+                if same_browser is not None:
+                    resp = driver.focus_tab(tid, session_id=str(same_browser.get("id")))
+                    focused = bool(resp and resp.get("ok"))
+            return {
+                "status": "reused_existing_tab",
+                "session_id": sid,
+                "url": pick.get("url"),
+                "title": pick.get("title"),
+                "browser_label": pick.get("browser_label"),
+                "browser_focused": focused,
+            }
     if session_id is not None:
         switch_session(session_id=session_id)
-    driver = require_driver()
     driver.jump(url, timeout=timeout)
     return {
-        "status": "ok",
+        "status": "navigated_current_tab",
         "active_session_id": driver.default_session_id,
         "url": url,
     }
@@ -588,6 +708,126 @@ def element_action(
     return semantic.element_action(
         require_driver(), ref=ref, action=action, value=value, expect_doc_id=expect_doc_id
     )
+
+
+@mcp.tool(description=(
+    "Execute a sequence of element actions in one call (same actions as element_action: "
+    "click/fill/clear/select/check/uncheck/hover/focus/scrollIntoView). actions_json: JSON "
+    "array of {ref, action, value}. Stops at the first failure or document change and "
+    "reports exactly what executed; pass expect_doc_id from your snapshot."
+))
+def element_action_batch(
+    actions_json: str,
+    expect_doc_id: str = "",
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    try:
+        actions = json.loads(actions_json or "[]")
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"actions_json is not valid JSON: {e}")
+    if not isinstance(actions, list) or not actions:
+        raise RuntimeError("actions_json must be a non-empty JSON array of {ref, action, value} objects")
+    return semantic.element_action_batch(require_driver(), actions, expect_doc_id=expect_doc_id)
+
+
+@mcp.tool(description=(
+    "Wait until a condition is met (polls inside the page every 250ms — use instead of "
+    "blind sleeps). kind: 'selector' (visible element match), 'selector_exists', 'ref' "
+    "(a snapshot ref is still connected), 'url_contains', 'title_contains', 'text' "
+    "(visible text contains value), 'idle' (document readyState complete). Returns "
+    "met=true/false with waited_ms; page-side timeout capped at 60s."
+))
+def wait_for(
+    kind: str,
+    value: str = "",
+    timeout: float = 10.0,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.wait_for(require_driver(), kind=kind, value=value, timeout=timeout)
+
+
+@mcp.tool(description=(
+    "Upload local file(s) through the page's file-chooser dialog via CDP. click_selector: "
+    "CSS selector of the control that opens the chooser (e.g. 'input[type=file]' or the "
+    "upload button). files_csv: comma-separated absolute local file paths."
+))
+def file_upload(
+    click_selector: str,
+    files_csv: str,
+    timeout: float = 15.0,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    selector = str(click_selector or "").strip()
+    if not selector:
+        raise RuntimeError("click_selector is required")
+    files = [f.strip() for f in str(files_csv or "").split(",") if f.strip()]
+    if not files:
+        raise RuntimeError("files_csv must contain at least one absolute file path")
+    for f in files:
+        if not Path(f).expanduser().exists():
+            raise RuntimeError(f"file not found: {f}")
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    ensure_sessions()
+    click_expr = f"document.querySelector({json.dumps(selector)}).click()"
+    payload = {
+        "cmd": "cdp_file_chooser_fill",
+        "files": files,
+        "clickExpression": click_expr,
+        "timeoutMs": int(timeout * 1000),
+    }
+    return exec_js(json.dumps(payload), timeout=timeout + 10.0)
+
+
+@mcp.tool(description=(
+    "Read captured page console output (console.log/info/warn/error/debug, window.onerror, "
+    "unhandledrejection). Capture hooks install on first use for the current document and "
+    "persist until navigation; buffer keeps the last 100 entries. level filters "
+    "(e.g. 'error'); since_seq returns only entries newer than that seq."
+))
+def console_log(
+    level: str = "",
+    since_seq: int = 0,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.console_log(require_driver(), level=level, since_seq=since_seq)
+
+
+@mcp.tool(description=(
+    "Read captured page network activity (fetch/XHR: method, url, status, ok and the first "
+    "2KB of the response body). Hooks install on first use for the current document; buffer "
+    "keeps the last 80 requests. url_filter is a case-insensitive substring match; "
+    "since_seq returns only newer entries. Ideal for reading JSON APIs directly."
+))
+def network_log(
+    url_filter: str = "",
+    since_seq: int = 0,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    return semantic.network_log(require_driver(), url_filter=url_filter, since_seq=since_seq)
+
+
+@mcp.tool(description=(
+    "List recent browser downloads via the extension bridge, most recent first. "
+    "state filter: '' (all) | in_progress | complete | interrupted."
+))
+def downloads_list(
+    state: str = "",
+    limit: int = 20,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    if session_id is not None:
+        switch_session(session_id=session_id)
+    payload = {"cmd": "downloads", "state": str(state or ""), "limit": int(limit)}
+    return exec_js(json.dumps(payload), timeout=15.0)
 
 
 @mcp.tool(description="Execute arbitrary JS in the current page context or send JSON CDP bridge commands through the page bridge.")

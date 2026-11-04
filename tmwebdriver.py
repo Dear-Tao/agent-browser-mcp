@@ -69,8 +69,10 @@ class TMWebDriver:
         self.host, self.port = host, port
         self.bind_host = bind_host or '0.0.0.0'
         self.sessions, self.results, self.acks = {}, {}, {}
-        self.default_session_id = None  
-        self.latest_session_id = None  
+        self.default_session_id = None
+        self.latest_session_id = None
+        # execute_js 超时后放弃的 exec_id：晚到的结果直接丢弃，防止 results 无限增长
+        self._late_results = set()
         self.is_remote = socket.socket().connect_ex(('127.0.0.1', port + 1)) == 0
         if not self.is_remote:  
             self.start_ws_server()  
@@ -108,10 +110,15 @@ class TMWebDriver:
         @app.route('/api/result', method=['GET','POST'])
         def result():
             data = request.json
-            if data.get('type') == 'result':  
-                self.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}  
-            elif data.get('type') == 'error':  
-                self.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
+            _id = data.get('id')
+            if _id in self._late_results:   # 超时孤儿结果，丢弃
+                self._late_results.discard(_id)
+                self.acks.pop(_id, None)
+                return 'ok'
+            if data.get('type') == 'result':
+                self.results[_id] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}
+            elif data.get('type') == 'error':
+                self.results[_id] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}
             return 'ok'
 
         @app.route('/link', method=['GET','POST'])
@@ -167,6 +174,10 @@ class TMWebDriver:
                         browser_meta = data.get('browser') or {}
                         browser_id = browser_meta.get('id') or ''
                         browser_label = browser_meta.get('label') or ''
+                        # 用户"正在看"的标签（最后聚焦窗口的激活标签，数字 tabId）
+                        active_tab_id = data.get('active_tab_id')
+                        # 本浏览器是否真正持有系统焦点（多浏览器实例时防误标）
+                        browser_focused = bool(data.get('focused'))
                         current_tab_ids = {
                             make_ext_session_id(
                                 tab.get('browser_id') or browser_id or '',
@@ -209,6 +220,16 @@ class TMWebDriver:
                                 'tab_id': int(tab_id) if tab_id is not None else None,
                                 'browser_id': bid,
                                 'browser_label': blabel,
+                                # 用户当前正在浏览的标签（系统焦点所在浏览器的激活标签）
+                                'is_active_tab': (
+                                    browser_focused
+                                    and active_tab_id is not None
+                                    and tab_id is not None
+                                    and int(tab_id) == int(active_tab_id)
+                                ),
+                                # 仅窗口内激活（多窗口时每窗口一个，供参考）
+                                'window_active': bool(tab.get('active')),
+                                'window_id': tab.get('windowId'),
                             }
                             if sess and sess.is_active() and sess.ws_client is self:
                                 # 同连接刷新元数据，保留首次 connected_at 便于区分来源
@@ -224,10 +245,20 @@ class TMWebDriver:
                                 }
                                 driver._register_client(session_id, self, session_info)
                     elif data.get('type') == 'ack': driver.acks[data.get('id','')] = True
-                    elif data.get('type') == 'result':  
-                        driver.results[data.get('id')] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}  
-                    elif data.get('type') == 'error':  
-                        driver.results[data.get('id')] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
+                    elif data.get('type') == 'result':
+                        _id = data.get('id')
+                        if _id in driver._late_results:   # 超时孤儿结果，丢弃
+                            driver._late_results.discard(_id)
+                            driver.acks.pop(_id, None)
+                        else:
+                            driver.results[_id] = {'success': True, 'data': data.get('result'), 'newTabs': data.get('newTabs', [])}
+                    elif data.get('type') == 'error':
+                        _id = data.get('id')
+                        if _id in driver._late_results:   # 超时孤儿结果，丢弃
+                            driver._late_results.discard(_id)
+                            driver.acks.pop(_id, None)
+                        else:
+                            driver.results[_id] = {'success': False, 'data': data.get('error'), 'newTabs': data.get('newTabs', [])}  
                 except Exception as e:  
                     _safe_print(f"Error handling message: {e}")
                     if hasattr(self, 'data'):
@@ -278,10 +309,14 @@ class TMWebDriver:
         if not session or not session.is_active(): 
             time.sleep(3)
             session = self.sessions.get(session_id)
-            if not session or not session.is_active(): 
+            if not session or not session.is_active():
                 alive_sessions = [s for s in self.sessions.values() if s.is_active()]
                 if alive_sessions:
-                    session = alive_sessions[0]  
+                    # 优先切到用户正在看的标签，其次第一个存活会话
+                    session = next(
+                        (s for s in alive_sessions if (s.info or {}).get('is_active_tab')),
+                        alive_sessions[0],
+                    )
                     _safe_print(f"会话 {session_id} 未连接，自动切换到最新活动会话: {session.id}")
                     session_id = self.default_session_id = session.id
                 if not session or not session.is_active(): 
@@ -310,7 +345,8 @@ class TMWebDriver:
                 if not session.is_active(): hasjump = True
                 if hasjump and session.is_active():
                     return {'result': f"Session {session_id} reloaded.", "closed":1}
-            if time.time() - start_time > timeout:  
+            if time.time() - start_time > timeout:
+                self._late_results.add(exec_id)  # 晚到的结果将被丢弃
                 if tp in ['ws', 'ext_ws']:
                     if hasjump: return {'result': f"Session {session_id} reloaded and new page is loading...", 'closed':1}
                     if acked: return {"result": f"No response data in {timeout}s (ACK received, script may still be running)"}
@@ -340,9 +376,16 @@ class TMWebDriver:
         return {session['id']: session['url'] for session in self.get_all_sessions()}
         
     def find_session(self, url_pattern: str):
-        if url_pattern == '': 
+        if url_pattern == '':
             session = self.sessions.get(self.latest_session_id)
-            return [(session.id, session.info)] if session else []
+            if session and session.is_active():
+                return [(session.id, session.info)]
+            # latest 已断连：回落到任意存活会话（优先用户正在看的）
+            alive = [s for s in self.sessions.values() if s.is_active()]
+            if alive:
+                s = next((x for x in alive if (x.info or {}).get('is_active_tab')), alive[0])
+                return [(s.id, s.info)]
+            return []
         matching_sessions = []  
         for session in self.sessions.values():
             if not session.is_active(): continue
@@ -364,7 +407,23 @@ class TMWebDriver:
         _safe_print(f"成功设置默认会话: {self.default_session_id}: {info['url']}")  
         return self.default_session_id  
     
-    def jump(self, url, timeout=10): self.execute_js(f"window.location.href='{url}'", timeout=timeout)
+    def jump(self, url, timeout=10): self.execute_js(f"window.location.href={json.dumps(str(url))}", timeout=timeout)
+
+    def focus_tab(self, tab_id, session_id=None):
+        """让浏览器把焦点真正切到指定标签页（扩展 chrome.tabs.update + windows.update）。
+
+        通过页面桥下发命令；多浏览器时 session_id 必须指向同一浏览器的某个会话。
+        """
+        try:
+            r = self.execute_js(
+                json.dumps({"cmd": "tabs", "method": "switch", "tabId": int(tab_id)}),
+                timeout=10, session_id=session_id)
+            data = r.get('data') if isinstance(r, dict) else r
+            return data if isinstance(data, dict) else None
+        except Exception as exc:
+            _safe_print('tabs/switch failed:', str(exc)[:120])
+            return None
+
     def newtab(self, url=None):
         if url is None: url = "http://www.baidu.com/robots.txt"
         # 优先走扩展 chrome.tabs.create。页面脚本没有用户手势时，popup blocker
