@@ -8,3 +8,5 @@ temp_desktop.png
 .cursor/
 _restart*.log
 chrome_extension.zip
+recordings/
+_bridge_owner*

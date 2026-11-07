@@ -386,6 +386,23 @@
       </section>
 
       <section class="sec">
+        <div class="sec-h">操作录制</div>
+        <div class="row2">
+          <div class="idline" id="recStatusLine" style="cursor:default">
+            <code id="recStatusText">未开启</code>
+          </div>
+          <button type="button" class="btn primary" id="recToggle">开始录制</button>
+        </div>
+        <div class="field" style="margin-top:8px">
+          <button type="button" class="idline" id="recSessionId" title="点击复制本次录制 ID，粘贴给 Agent 即可精准定位">
+            <code id="recSessionIdText">—</code>
+            <em id="recSessionIdHint">复制</em>
+          </button>
+        </div>
+        <p id="recHint" class="hint">录制本浏览器的点击 / 输入 / 请求 / 响应 / 跳转（含完整参数与响应体）。录制中浏览器顶部会出现调试横幅，属正常现象。</p>
+      </section>
+
+      <section class="sec">
         <div class="sec-h">桥接</div>
         <div class="grid">
           <div class="field">

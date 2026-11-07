@@ -9,4 +9,5 @@ document.querySelectorAll('meta[http-equiv="Content-Security-Policy"]').forEach(
 // the DOM is shared between the page and this content script and the sender
 // cannot be authenticated. All bridge traffic now flows through the extension
 // service worker directly (WS → handleExtMessage / executeScript).
+// 操作录制采集已迁移到 recorder_capture.js（manifest + 开始录制时主动注入）。
 })();

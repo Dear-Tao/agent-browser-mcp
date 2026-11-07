@@ -188,6 +188,8 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 async function debuggerAttachSafe(tabId) {
+  // 录制中的标签页已由录制器持有 debugger attach：直接复用，不要 detach（会杀死录制会话）
+  if (recCdpAttached && recCdpAttached.has(tabId)) return;
   try {
     await chrome.debugger.detach({ tabId });
   } catch (_) {}
@@ -469,8 +471,489 @@ async function handleExtMessage(msg, sender) {
       return { ok: false, error: 'Unknown method: ' + msg.method };
     } catch (e) { return { ok: false, error: e.message }; }
   }
+  if (msg.cmd === 'recorder') return await handleRecorder(msg);
+  if (msg.cmd === 'rec_event') return await handleRecEvent(msg);
   return { ok: false, error: 'Unknown cmd: ' + msg.cmd };
 }
+
+// --- 操作录制器（一期：录制 + 缓冲 + 导出数据源）---
+// 状态/缓冲都放 chrome.storage.local（每个浏览器 Profile 独立），SW 休眠不丢事件。
+// rid 为单调递增 id，服务端按 rid 去重（缓冲分片推送会重叠）。
+const TMWD_STORAGE_REC_STATE = 'tmwd_rec_state';
+const TMWD_STORAGE_REC_BUFFER = 'tmwd_rec_buffer';
+const TMWD_STORAGE_REC_SEQ = 'tmwd_rec_seq';
+const REC_BUFFER_CAP = 10000;
+const REC_BODY_CAP = 8192;      // 响应体截断（商品列表等大 JSON 需要）
+const REC_PUSH_BATCH_BYTES = 256 * 1024; // 单条 WS 消息按字节分批（服务端 MAXPAYLOAD 32MB）
+let recState = null;        // 缓存的录制开关状态
+let recStateLoaded = false; // SW 冷启动后是否已从 storage 恢复
+let recBuffer = [];
+let recBufferLoaded = false;
+let recSeq = 0;
+let recPushedSeq = 0;       // 已推送到服务端的最大 rid（防缓冲滚动后旧事件丢失）
+let recFlushTimer = null;
+
+function recLocalStamp() {
+  const d = new Date();
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
+}
+
+async function recGetState() {
+  if (!recStateLoaded) {
+    const s = await chrome.storage.local.get(TMWD_STORAGE_REC_STATE);
+    recState = s[TMWD_STORAGE_REC_STATE] || null;
+    recStateLoaded = true;
+  }
+  return recState;
+}
+
+let recLoadPromise = null;  // 并发加载记忆化：避免双调用方互相覆盖刚追加的事件
+
+async function recLoadBuffer() {
+  if (recBufferLoaded) return recBuffer;
+  if (!recLoadPromise) {
+    recLoadPromise = (async () => {
+      const s = await chrome.storage.local.get([
+        TMWD_STORAGE_REC_BUFFER,
+        TMWD_STORAGE_REC_SEQ,
+        'tmwd_rec_pushed',
+      ]);
+      recBuffer = Array.isArray(s[TMWD_STORAGE_REC_BUFFER]) ? s[TMWD_STORAGE_REC_BUFFER] : [];
+      recSeq = Number(s[TMWD_STORAGE_REC_SEQ]) || 0;
+      recPushedSeq = Number(s.tmwd_rec_pushed) || 0;
+      if (recBuffer.length) {
+        // 历史事件 24 小时自动过期：隔天再录不会带着陈旧时间线
+        const cutoff = Date.now() - 24 * 3600 * 1000;
+        const fresh = recBuffer.filter((e) => (Number(e.ts) || 0) >= cutoff);
+        if (fresh.length !== recBuffer.length) {
+          recBuffer = fresh;
+          void chrome.storage.local.set({ [TMWD_STORAGE_REC_BUFFER]: fresh });
+        }
+      }
+      if (recBuffer.length) {
+        const maxRid = Math.max(...recBuffer.map((e) => Number(e.rid) || 0));
+        if (maxRid > recSeq) recSeq = maxRid;
+        // SW 冷启动后与可能已重启的服务端之间留 200 条重叠窗口，靠服务端 rid 去重兜底
+        if (recPushedSeq < maxRid - 200) recPushedSeq = maxRid - 200;
+      }
+      recBufferLoaded = true;
+      return recBuffer;
+    })();
+  }
+  await recLoadPromise;
+  return recBuffer;
+}
+
+async function recPersist() {
+  try {
+    // 持久化瘦身：body 只保留最近 500 条（storage 配额保护：最坏 500×8KB≈4MB < 10MB 配额），
+    // 更早的事件只留元数据；正常流程无影响（body 已实时推送至服务端），
+    // 仅影响"服务端丢失后靠扩展缓冲 repush 恢复"场景的早期事件保真度
+    const buf = recBuffer.slice(-REC_BUFFER_CAP);
+    const keepBodies = 500;
+    const slim = buf.map((e, idx) => (
+      idx < buf.length - keepBodies && e.body !== undefined ? { ...e, body: undefined } : e
+    ));
+    await chrome.storage.local.set({
+      [TMWD_STORAGE_REC_BUFFER]: slim,
+      [TMWD_STORAGE_REC_SEQ]: recSeq,
+      tmwd_rec_pushed: recPushedSeq,
+    });
+  } catch (_) {}
+}
+
+function recScheduleFlush() {
+  if (recFlushTimer) return;
+  recFlushTimer = setTimeout(() => {
+    recFlushTimer = null;
+    void recPersist().then(() => recPushToServer());
+  }, 800);
+}
+
+async function recPushToServer() {
+  try {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    await recLoadBuffer();
+    if (!recBuffer.length) return;
+    // 只推未推送过的 rid（缓冲滚动后旧事件不丢）；按字节分批（胖事件友好）
+    const pending = recBuffer.filter((e) => (Number(e.rid) || 0) > recPushedSeq);
+    if (!pending.length) return;
+    const ident = await loadBrowserIdentity();
+    let bytes = 0;
+    let batch = [];
+    for (const ev of pending) {
+      const size = JSON.stringify(ev).length;
+      if (batch.length && bytes + size > REC_PUSH_BATCH_BYTES) {
+        ws.send(JSON.stringify({
+          type: 'rec_events',
+          browser: { id: ident.id, label: ident.display },
+          events: batch,
+        }));
+        recPushedSeq = Math.max(recPushedSeq, Number(batch[batch.length - 1].rid) || recPushedSeq);
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(ev);
+      bytes += size;
+    }
+    if (batch.length) {
+      ws.send(JSON.stringify({
+        type: 'rec_events',
+        browser: { id: ident.id, label: ident.display },
+        events: batch,
+      }));
+      recPushedSeq = Math.max(recPushedSeq, Number(batch[batch.length - 1].rid) || recPushedSeq);
+    }
+  } catch (_) {}
+}
+
+async function handleRecorder(msg) {
+  const method = msg.method || 'status';
+  const state = await recGetState();
+    if (method === 'start') {
+    if (state && state.active) {
+      await recLoadBuffer();
+      return { ok: true, already: true, browser_id: state.browser_id,
+               browser_label: state.browser_label, started_at: state.started_at,
+               events: recBuffer.length };
+    }
+    const ident = await loadBrowserIdentity();
+    const st = {
+      active: true,
+      session_id: 'rec_' + recLocalStamp(),
+      browser_id: ident.id,
+      browser_label: ident.display,
+      started_at: new Date().toISOString(),
+    };
+    recState = st;
+    recStateLoaded = true;
+    recBuffer = [];
+    recBufferLoaded = true;
+    recPushedSeq = recSeq; // recSeq 不归零（rid 全局单调），游标直接对齐
+    await chrome.storage.local.set({
+      [TMWD_STORAGE_REC_STATE]: st,
+      [TMWD_STORAGE_REC_BUFFER]: [],
+    });
+    // 关键：向所有已存在的标签页（含 iframe）主动注入采集代码——
+    // 扩展更新后旧页面跑的是旧采集脚本，仅靠 manifest 声明永远覆盖不到
+    const injectResults = [];
+    try {
+      const tabs = await chrome.tabs.query({});
+      const jobs = tabs.filter((t) => isScriptable(t.url)).map(async (t) => {
+        try {
+          await chrome.scripting.executeScript({
+            target: { tabId: t.id, allFrames: true },
+            files: ['recorder_capture.js'],
+          });
+          return { tabId: t.id, url: String(t.url || '').slice(0, 60), ok: true };
+        } catch (e) {
+          return { tabId: t.id, url: String(t.url || '').slice(0, 60), ok: false,
+                   error: String((e && e.message) || e).slice(0, 100) };
+        }
+      });
+      injectResults.push(...await Promise.allSettled(jobs).then((rs) => rs.map((r) => r.value || { ok: false, error: 'unsettled' })));
+    } catch (e) {
+      injectResults.push({ ok: false, error: 'query: ' + String((e && e.message) || e).slice(0, 100) });
+    }
+    void recCdpAttachAll(); // CDP 响应体捕获（横幅 = 录制中提示）
+    const injectedOk = injectResults.filter((r) => r.ok).length;
+    return { ok: true, ...st, injected_tabs: injectedOk, inject_results: injectResults };
+  }
+  if (method === 'stop') {
+    await recLoadBuffer();
+    if (recFlushTimer) { clearTimeout(recFlushTimer); recFlushTimer = null; }
+    await recPersist();
+    const stoppedAt = new Date().toISOString();
+    if (state && state.active) {
+      const stopped = { ...state, active: false, stopped_at: stoppedAt };
+      recState = stopped;
+      await chrome.storage.local.set({ [TMWD_STORAGE_REC_STATE]: stopped });
+      await recPushToServer();
+      // 通知服务端该会话已结束（服务端自动把该次会话落盘为 recordings/<session_id>.*）
+      try {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'rec_stopped',
+            session_id: state.session_id,
+            browser: { id: state.browser_id, label: state.browser_label },
+            events: recBuffer.length,
+          }));
+        }
+      } catch (_) {}
+      void recCdpDetachAll(); // 释放 debugger attach（横幅消失）
+      return { ok: true, stopped: true, session_id: state.session_id,
+               browser_id: state.browser_id,
+               browser_label: state.browser_label, events: recBuffer.length,
+               started_at: state.started_at, stopped_at: stoppedAt };
+    }
+    return { ok: true, stopped: false, note: 'not recording', events: recBuffer.length };
+  }
+  if (method === 'dump') {
+    await recLoadBuffer();
+    return { ok: true, state, events: recBuffer };
+  }
+  if (method === 'repush') {
+    // 恢复路径：重置推送游标，把整个缓冲重新推给服务端（rid 去重由服务端负责）
+    await recLoadBuffer();
+    recPushedSeq = 0;
+    await recPersist();
+    await recPushToServer();
+    return { ok: true, repushed: recBuffer.length };
+  }
+  // status
+  await recLoadBuffer();
+  return {
+    ok: true,
+    recording: !!(state && state.active),
+    session_id: state ? state.session_id : null,
+    browser_id: state ? state.browser_id : null,
+    browser_label: state ? state.browser_label : null,
+    started_at: state ? state.started_at : null,
+    events: recBuffer.length,
+  };
+}
+
+async function handleRecEvent(msg) {
+  const state = await recGetState();
+  if (!state || !state.active) return { ok: false, note: 'not recording' };
+  const ev = msg.event;
+  if (!ev || typeof ev !== 'object') return { ok: false, error: 'no event' };
+  await recLoadBuffer();
+  // 双保险去重：多监听器场景（旧世界残留）下，同一元素 100ms 内的重复 click 折叠
+  const prev = recBuffer[recBuffer.length - 1];
+  if (ev.type === 'click' && prev && prev.type === 'click'
+    && prev.css === ev.css && (prev.id || '') === (ev.id || '')
+    && Math.abs((ev.ts || 0) - (prev.ts || 0)) < 100) {
+    return { ok: true, dedup: true };
+  }
+  recSeq += 1;
+  recBuffer.push({ ...ev, rid: recSeq, session: state.session_id, browser_id: state.browser_id, ts: ev.ts || Date.now() });
+  if (recBuffer.length > REC_BUFFER_CAP) {
+    recBuffer.splice(0, recBuffer.length - REC_BUFFER_CAP);
+  }
+  recScheduleFlush();
+  return { ok: true };
+}
+
+// --- 录制响应体（CDP Network 域：录制期间持有 debugger attach，横幅即"录制中"提示）---
+const recCdpAttached = new Set(); // tabId 集合：录制器持有的 debugger attach
+const recCdpPending = new Map();  // cdpRequestId -> { url, status }
+
+function recIsNoiseUrl(url) {
+  // 静态资源 / 桥接自探针 / Cloudflare 挑战 / 统计埋点不进时间线
+  try {
+    if (/\.(js|mjs|css|png|jpe?g|gif|webp|svg|woff2?|ico|mp4|mp3)(\?|$)/i.test(url)) return true;
+    if (/^https?:\/\/(127\.0\.0\.1|localhost):(18865|18866)\//i.test(url)) return true;
+    if (/\/cdn-cgi\//i.test(url)) return true;
+    if (/(google-analytics\.com|googletagmanager\.com|doubleclick\.net|\/g\/collect|_private\/browser\/rum)/i.test(url)) return true;
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
+async function recCdpAttachTab(tabId) {
+  if (recCdpAttached.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({ tabId }, '1.3');
+    await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+    recCdpAttached.add(tabId);
+  } catch (e) {
+    // SW 重启后旧 attach 仍有效（同一扩展身份）：attach 报 already attached 时
+    // 尝试直接用 Network.enable 验证客户端身份，成功则视为已持有
+    const msg = String((e && e.message) || e);
+    if (/already attached/i.test(msg)) {
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Network.enable', {});
+        recCdpAttached.add(tabId);
+      } catch (_) {}
+    }
+  }
+}
+
+async function recCdpAttachAll() {
+  try {
+    const tabs = await chrome.tabs.query({});
+    for (const t of tabs) {
+      if (isScriptable(t.url)) await recCdpAttachTab(t.id);
+    }
+  } catch (_) {}
+}
+
+async function recCdpDetachAll() {
+  for (const tabId of Array.from(recCdpAttached)) {
+    try { await chrome.debugger.detach({ tabId }); } catch (_) {}
+    recCdpAttached.delete(tabId);
+  }
+}
+
+async function recCdpHandleEvent(source, method, params) {
+  if (!method || !method.startsWith('Network.')) return;
+  const st = await recGetState();
+  if (!st || !st.active) return;
+  const tabId = source && source.tabId;
+  if (!tabId) return;
+  // 只对"值得录的请求"做自愈挂载，静态资源事件不触发（避免 attach 风暴）
+  const isRecordableRequest = method === 'Network.requestWillBeSent'
+    && ((params.type || '') === 'XHR' || (params.type || '') === 'Fetch');
+  if (!recCdpAttached.has(tabId)) {
+    if (!isRecordableRequest) return;
+    await recCdpAttachTab(tabId);
+    if (!recCdpAttached.has(tabId)) return;
+  }
+  if (method === 'Network.requestWillBeSent') {
+    // 只录 API 类请求；Script/样式/图片等静态资源与主文档导航不进时间线
+    if (!isRecordableRequest) return;
+    const req = params.request || {};
+    const url = String(req.url || '');
+    if (!/^https?:/i.test(url)) return;
+    if (recIsNoiseUrl(url)) return;
+    await recLoadBuffer();
+    recSeq += 1;
+    const rid = recSeq;
+    const ev = {
+      type: 'request', method: req.method, url: url.slice(0, 500),
+      rid, session: st.session_id, browser_id: st.browser_id, ts: Date.now(), via: 'cdp', tabId,
+    };
+    if (req.postData) ev.postData = String(req.postData).slice(0, REC_BODY_CAP);
+    recBuffer.push(ev);
+    if (recBuffer.length > REC_BUFFER_CAP) recBuffer.splice(0, recBuffer.length - REC_BUFFER_CAP);
+    recScheduleFlush();
+    recCdpPending.set(params.requestId, { rid });
+  } else if (method === 'Network.responseReceived') {
+    const pend = recCdpPending.get(params.requestId);
+    if (!pend) return; // 请求本身已被过滤（noise/非 API），响应同样不记
+    const resp = params.response || {};
+    const mime = String(resp.mimeType || '').toLowerCase();
+    // CSS/JS chunk/图片等非 API 响应：连带移除其请求事件（XHR 加载的样式/模块无扩展名，URL 过滤拦不住）
+    if (mime.includes('css') || mime.includes('javascript') || mime.startsWith('image/')
+      || mime.startsWith('font/') || mime.startsWith('video/') || mime.startsWith('audio/')
+      || mime === 'application/octet-stream') {
+      recCdpPending.delete(params.requestId);
+      if (pend.rid) {
+        const idx = recBuffer.findIndex((e) => e.rid === pend.rid);
+        if (idx !== -1) recBuffer.splice(idx, 1);
+      }
+      return;
+    }
+    recCdpPending.set(params.requestId, {
+      rid: pend.rid,
+      url: String(resp.url || '').slice(0, 500),
+      status: resp.status,
+      mime,
+    });
+    if (recCdpPending.size > 500) {
+      const oldest = recCdpPending.keys().next().value;
+      recCdpPending.delete(oldest);
+    }
+  } else if (method === 'Network.loadingFinished') {
+    const meta = recCdpPending.get(params.requestId);
+    recCdpPending.delete(params.requestId);
+    if (!meta) return;
+    // 只抓文本类响应体；图片/二进制（无扩展名的头像、像素 GIF 等）只记状态
+    const mime = (meta.mime || '').toLowerCase();
+    const isText = mime.startsWith('text/') || mime.includes('json')
+      || mime.includes('javascript') || mime.includes('xml') || mime.includes('x-www-form-urlencoded')
+      || mime === '';
+    let body = '';
+    try {
+      if (isText) {
+        const r = await chrome.debugger.sendCommand({ tabId }, 'Network.getResponseBody', { requestId: params.requestId });
+        body = String(r.body || '');
+      if (r.base64Encoded) body = atob(body);
+      body = body.slice(0, REC_BODY_CAP);
+      }
+    } catch (_) {}
+    await recLoadBuffer();
+    recSeq += 1;
+    recBuffer.push({
+      type: 'response', url: meta.url, status: meta.status, body,
+      rid: recSeq, session: st.session_id, browser_id: st.browser_id, ts: Date.now(),
+    });
+    if (recBuffer.length > REC_BUFFER_CAP) recBuffer.splice(0, recBuffer.length - REC_BUFFER_CAP);
+    recScheduleFlush();
+  } else if (method === 'Network.loadingFailed') {
+    const meta = recCdpPending.get(params.requestId);
+    recCdpPending.delete(params.requestId);
+    if (!meta) return;
+    await recLoadBuffer();
+    recSeq += 1;
+    recBuffer.push({
+      type: 'response', url: meta.url, status: 'failed', errorText: String(params.errorText || '').slice(0, 100),
+      rid: recSeq, session: st.session_id, browser_id: st.browser_id, ts: Date.now(),
+    });
+    recScheduleFlush();
+  }
+}
+
+chrome.debugger.onEvent.addListener((source, method, params) => {
+  void recCdpHandleEvent(source, method, params).catch(() => {});
+});
+chrome.debugger.onDetach.addListener((source) => {
+  if (source && source.tabId) recCdpAttached.delete(source.tabId);
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes[TMWD_STORAGE_REC_STATE]) {
+    recState = changes[TMWD_STORAGE_REC_STATE].newValue || null;
+    recStateLoaded = true;
+  }
+});
+
+// --- 录制网络请求（webRequest 后台级：不依赖页面存活，跨导航稳定）---
+// 只录 xmlhttprequest（fetch/XHR API 调用）；main_frame 导航由 tabs.onUpdated 记录。
+// 状态码由 onCompleted 回填；已推送游标之后才回填的状态会丢失（大多数 API <800ms 内完成）。
+const recReqStatusMap = new Map(); // requestId -> rid
+const REC_REQ_MAP_CAP = 500;
+
+chrome.webRequest.onBeforeRequest.addListener((details) => {
+  void (async () => {
+    try {
+      if (recCdpAttached.has(details.tabId)) return; // CDP 已在录该 tab，避免重复
+      const st = await recGetState();
+      if (!st || !st.active) return;
+      if (details.type !== 'xmlhttprequest') return;
+      const url = String(details.url || '');
+      if (!/^https?:/i.test(url)) return;
+      if (recIsNoiseUrl(url)) return;
+      if (/\.(js|mjs|css|png|jpe?g|gif|webp|svg|woff2?|ico|mp4|mp3)(\?|$)/i.test(url)) return;
+      await recLoadBuffer();
+      recSeq += 1;
+      const rid = recSeq;
+      recBuffer.push({
+        type: 'request', method: details.method, url: url.slice(0, 500),
+        tabId: details.tabId, requestId: details.requestId,
+        rid, session: st.session_id, browser_id: st.browser_id, ts: Date.now(),
+      });
+      if (recBuffer.length > REC_BUFFER_CAP) {
+        recBuffer.splice(0, recBuffer.length - REC_BUFFER_CAP);
+      }
+      recReqStatusMap.set(details.requestId, rid);
+      if (recReqStatusMap.size > REC_REQ_MAP_CAP) {
+        const oldest = recReqStatusMap.keys().next().value;
+        recReqStatusMap.delete(oldest);
+      }
+      recScheduleFlush();
+    } catch (_) {}
+  })();
+}, { urls: ['http://*/*', 'https://*/*'] });
+
+chrome.webRequest.onCompleted.addListener((details) => {
+  void (async () => {
+    try {
+      const st = await recGetState();
+      const rid = recReqStatusMap.get(details.requestId);
+      recReqStatusMap.delete(details.requestId);
+      if (!st || !st.active || rid === undefined) return;
+      await recLoadBuffer();
+      const ev = recBuffer.find((e) => e.rid === rid);
+      if (ev) ev.status = details.statusCode;
+    } catch (_) {}
+  })();
+}, { urls: ['http://*/*', 'https://*/*'] });
+
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   handleExtMessage(msg, sender).then(sendResponse);
@@ -914,14 +1397,54 @@ async function sendTabsUpdate(type = 'tabs_update') {
   );
   console.log('[TMWD-WS] Sent', type, 'browser=', browser.display, 'tabs=', tabs.length, 'active=', activeTabId);
 }
-chrome.tabs.onUpdated.addListener((_, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'complete') sendTabsUpdate();
+  // 录制中：记录本浏览器内的页面导航（含 SPA history 变化）
+  if (changeInfo.status === 'complete' || changeInfo.url) {
+    void (async () => {
+      try {
+        const st = await recGetState();
+        if (!st || !st.active) return;
+        if (changeInfo.status === 'complete') {
+          // 新加载的页面补挂 CDP（SW 冷启动/新标签页场景）
+          if (tab && isScriptable(tab.url)) void recCdpAttachTab(tabId);
+        }
+        const url = changeInfo.url || tab.url || '';
+        if (!/^https?:/i.test(url)) return;
+        if (recIsNoiseUrl(url)) return;
+        // 去重改为比对缓冲末尾（持久状态）：SW 重启不丢失去重上下文
+        await recLoadBuffer();
+        const lastEv = recBuffer[recBuffer.length - 1];
+        const title = tab.title || '';
+        if (lastEv && lastEv.type === 'nav' && lastEv.url === url && lastEv.title === title) return;
+        await handleRecEvent({ event: { type: 'nav', url, title } });
+      } catch (_) {}
+    })();
+  }
 });
 chrome.tabs.onRemoved.addListener(() => sendTabsUpdate());
-chrome.tabs.onCreated.addListener(() => sendTabsUpdate());
+chrome.tabs.onCreated.addListener((tab) => {
+  sendTabsUpdate();
+  void (async () => {
+    try {
+      const st = await recGetState();
+      if (st && st.active) {
+        if (!tab.url || isScriptable(tab.url)) await recCdpAttachTab(tab.id);
+      }
+    } catch (_) {}
+  })();
+});
 // 用户切换标签页/窗口时立即推送，服务端才能实时跟踪"当前打开的是哪个标签"
 chrome.tabs.onActivated.addListener(() => sendTabsUpdate());
 chrome.windows.onFocusChanged.addListener((windowId) => {
   // windowId === -1 表示焦点离开所有 Chrome 窗口，此时不用推送
   if (windowId !== chrome.windows.WINDOW_ID_NONE) sendTabsUpdate();
 });
+
+// SW 冷启动恢复：若录制仍在进行，重新挂 CDP（事件监听必须顶层注册，attach 需补）
+void (async () => {
+  try {
+    const st = await recGetState();
+    if (st && st.active) await recCdpAttachAll();
+  } catch (_) {}
+})();

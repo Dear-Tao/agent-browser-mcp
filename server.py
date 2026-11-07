@@ -50,6 +50,14 @@ mcp = MCPServer(
         "console_log / network_log read captured console output and fetch/XHR traffic "
         "(hooks install on first call; network_log returns JSON bodies up to 2KB — prefer it "
         "over DOM parsing for API-driven pages). downloads_list lists browser downloads.\n\n"
+        "Operation recorder: recorder_start(browser_label) records the user's real clicks / "
+        "inputs / submits / navigations AND the network traffic they trigger (requests with "
+        "method/URL/postData/status and response bodies up to 2KB via CDP — a debug banner shows "
+        "while recording; values are recorded verbatim for data fidelity). "
+        "recorder_stop stops everywhere; each stop auto-exports that session to "
+        "./recordings/<session_id>.md/.jsonl. recorder_sessions lists past sessions; "
+        "recorder_export(session='last' or <id>) reads one specific session — prefer it over "
+        "dumping the whole buffer when the user asks about a particular recording.\n\n"
         "Preferred flow for interacting with a page (avoids inventing CSS selectors each time):\n"
         "  1. page_snapshot()  -> interactive elements as {ref, role, name, tag}, plus a docId.\n"
         "  2. element_action(ref='e7', action='click') to act on one.\n"
@@ -119,6 +127,8 @@ def get_driver() -> TMWebDriver:
     ensure_config_js()
     if _driver is None:
         _driver = TMWebDriver(host=_DRIVER_HOST, port=_DRIVER_PORT, bind_host=_DRIVER_BIND)
+        # 会话结束自动落盘（扩展停止录制时触发；在持有 WS 的进程内执行）
+        _driver.on_rec_stopped = _auto_export_on_stop
     return _driver
 
 
@@ -828,6 +838,290 @@ def downloads_list(
         switch_session(session_id=session_id)
     payload = {"cmd": "downloads", "state": str(state or ""), "limit": int(limit)}
     return exec_js(json.dumps(payload), timeout=15.0)
+
+
+# --- 操作录制（一期：录制 / 停止 / 状态 / 导出时间线）---
+
+_REC_STORE_DIR = ROOT / "recordings"
+
+
+def _recorder_send(sessions: list[dict[str, Any]], method: str, timeout: float = 10.0) -> list[dict[str, Any]]:
+    """把 recorder 命令发给指定会话所在浏览器（storage 按 Profile 隔离，必须逐浏览器发送）。"""
+    driver = require_driver()
+    payload = json.dumps({"cmd": "recorder", "method": method})
+    results = []
+    for sess in sessions:
+        try:
+            r = driver.execute_js(payload, timeout=timeout, session_id=str(sess.get("id")))
+            data = r.get("data") if isinstance(r, dict) else r
+            if isinstance(data, dict):
+                data.setdefault("browser_label", sess.get("browser_label"))
+                data.setdefault("browser_id", sess.get("browser_id"))
+                results.append(data)
+        except Exception:
+            continue
+    return results
+
+
+def _rec_markdown(events: list[dict[str, Any]]) -> str:
+    """把事件流整理成按页面分段的人类可读时间线。
+
+    请求自动关联到 3 秒内的前置动作（缩进 ↳）；连续重复的同 method+url 请求
+    折叠为一行 ×N（心跳/长轮询噪音）。
+    """
+    lines: list[str] = ["# 操作录制时间线", ""]
+    seg = 0
+    last_action_ts: float | None = None
+    last_req_key: tuple | None = None
+    req_repeat = 0
+
+    def flush_req_repeat():
+        nonlocal req_repeat, last_req_key
+        if req_repeat > 1 and last_req_key is not None:
+            lines[-1] = lines[-1] + f" ×{req_repeat}"
+        req_repeat = 0
+        last_req_key = None
+
+    for ev in events:
+        etype = ev.get("type", "")
+        t = ev.get("ts_fmt") or ""
+        if etype == "nav":
+            flush_req_repeat()
+            seg += 1
+            last_action_ts = None
+            lines += ["", f"## 段落 {seg} — 打开页面", f"- 时间: {t}", f"- URL: {ev.get('url', '')}",
+                      f"- 标题: {ev.get('title', '')}"]
+            continue
+        if etype == "request":
+            key = (ev.get("method", ""), ev.get("url", ""))
+            req_line = (f"请求 {ev.get('method', '')} {str(ev.get('url', ''))[:120]}"
+                        f" → {ev.get('status') if ev.get('status') is not None else '?'}")
+            if ev.get("postData"):
+                req_line += f"  body: {str(ev.get('postData'))[:200]}"
+            # 关联：3 秒内跟在动作后面的请求，缩进显示归属
+            assoc = bool(last_action_ts) and float(ev.get("ts") or 0) - last_action_ts <= 3000
+            if last_req_key == key:
+                # 连续相同请求（心跳/长轮询）折叠为 ×N，沿用首行前缀
+                req_repeat += 1
+                continue
+            flush_req_repeat()
+            lines.append(f"{'    ↳ ' if assoc else '- '}{t} {req_line}")
+            last_req_key = key
+            req_repeat = 1
+            continue
+        if etype == "response":
+            body = str(ev.get("body") or "")
+            if not body:
+                continue  # 空 body 的响应行（图片/204 等）不进时间线
+            body_line = f"响应 {ev.get('url', '')[:120]} → {ev.get('status', '?')}"
+            body_line += f"  body: {body[:400]}"
+            lines.append(f"    ↳ {t} {body_line}")
+            continue
+        flush_req_repeat()
+        css = ev.get("css", "")
+        name = ev.get("name", "")
+        text = ev.get("text", "")
+        where = f" iframe:{ev.get('frame')}" if ev.get("frame") == "iframe" else ""
+        if etype == "click":
+            lines.append(f"- {t} 点击 [{text or name or css}] (`{css}`){where}")
+            last_action_ts = float(ev.get("ts") or 0)
+        elif etype == "input":
+            lines.append(f"- {t} 输入 [{name or css}] = \"{ev.get('value', '')}\"{where}")
+            last_action_ts = float(ev.get("ts") or 0)
+        elif etype == "check":
+            lines.append(f"- {t} {'勾选' if ev.get('checked') else '取消勾选'} [{name or css}]{where}")
+            last_action_ts = float(ev.get("ts") or 0)
+        elif etype == "enter":
+            lines.append(f"- {t} 回车提交 [{css}]{where}")
+            last_action_ts = float(ev.get("ts") or 0)
+    flush_req_repeat()
+    if len(lines) <= 2:
+        lines.append("(无事件)")
+    return "\n".join(lines) + "\n"
+
+
+@mcp.tool(description=(
+    "Start recording real user operations (clicks, inputs, submits, navigations) in the "
+    "named browser. Password/card fields are redacted as [REDACTED]. Events buffer in the "
+    "extension (survives SW restarts) and stream to the server. Stop with recorder_stop, "
+    "export with recorder_export."
+))
+def recorder_start(browser_label: str = "", session_id: Optional[str] = None) -> dict[str, Any]:
+    sessions = active_sessions()
+    if browser_label:
+        matches = _match_browser_sessions(browser_label)
+        if not matches:
+            known = sorted({str(s.get("browser_label") or "未命名") for s in sessions})
+            raise RuntimeError(f"No browser matching {browser_label!r}. Connected: {known}")
+        target = _pick_session_in_browser(matches)
+    elif session_id:
+        target = next((s for s in sessions if str(s.get("id")) == str(session_id)), None)
+        if target is None:
+            raise RuntimeError(f"Session {session_id} not connected")
+    else:
+        target = next((s for s in sessions if str(s.get("id")) == str(require_driver().default_session_id)), None)
+        if target is None:
+            target = sessions[0]
+    results = _recorder_send([target], "start")
+    if not results:
+        raise RuntimeError("recorder start failed: no reachable browser session")
+    # 新录制从干净的服务端缓冲开始（上一次导出后的残留不混入新时间线）
+    require_driver().get_rec_events(clear=True)
+    return {"status": "recording", **results[0],
+            "note": "User can now operate the browser manually. Stop with recorder_stop."}
+
+
+@mcp.tool(description=(
+    "Stop the operation recorder on ALL connected browsers (whichever one was recording "
+    "stops; others report not-recording). Returns per-browser results."
+))
+def recorder_stop() -> dict[str, Any]:
+    results = _recorder_send(active_sessions(), "stop")
+    stopped = [r for r in results if r.get("stopped")]
+    return {
+        "status": "ok" if results else "no_browser",
+        "stopped_browsers": stopped,
+        "all_results": results,
+    }
+
+
+@mcp.tool(description=(
+    "Report the recorder state per connected browser (recording?, event count, start time)."
+))
+def recorder_status() -> dict[str, Any]:
+    results = _recorder_send(active_sessions(), "status")
+    return {
+        "status": "ok" if results else "no_browser",
+        "browsers": results,
+        "server_buffered": len(require_driver().get_rec_events()),
+    }
+
+
+_REC_EXPORTED: dict[str, dict[str, Any]] = {}  # session_id -> 自动/手动导出的文件信息
+
+
+def _write_rec_export(events: list[dict[str, Any]], base: Path) -> dict[str, Any]:
+    for ev in events:
+        try:
+            ev["ts_fmt"] = time.strftime("%H:%M:%S", time.localtime(float(ev.get("ts", 0)) / 1000))
+        except Exception:
+            ev["ts_fmt"] = ""
+    md = _rec_markdown(events)
+    base.parent.mkdir(parents=True, exist_ok=True)
+    md_path = base.with_suffix(".md")
+    jsonl_path = base.with_suffix(".jsonl")
+    md_path.write_text(md, encoding="utf-8")
+    jsonl_path.write_text(
+        "\n".join(json.dumps(ev, ensure_ascii=False) for ev in events) + "\n",
+        encoding="utf-8",
+    )
+    counts: dict[str, int] = {}
+    for ev in events:
+        counts[ev.get("type", "?")] = counts.get(ev.get("type", "?"), 0) + 1
+    return {
+        "events": len(events),
+        "event_counts": counts,
+        "markdown": str(md_path),
+        "jsonl": str(jsonl_path),
+    }
+
+
+def _auto_export_on_stop(session_id: Optional[str], browser_id: str) -> None:
+    """扩展停止录制时（无论从 popup 还是 MCP）自动把该次会话落盘。"""
+    if not session_id:
+        return
+    try:
+        driver = require_driver()
+        events = [e for e in driver.get_rec_events() if e.get("session") == session_id]
+        if not events:
+            return
+        info = _write_rec_export(events, _REC_STORE_DIR / session_id)
+        info.update({"status": "ok", "session_id": session_id, "browser_id": browser_id})
+        _REC_EXPORTED[session_id] = info
+        print(f"[recorder] session {session_id} auto-exported -> {info['markdown']}", flush=True)
+    except Exception as e:
+        print(f"[recorder] auto-export failed for {session_id}: {e}", flush=True)
+
+
+@mcp.tool(description=(
+    "List recorded operation-recorder sessions (one per recorder_start), each with id, "
+    "browser, time range, event counts, and the exported file path if auto-exported. "
+    "Use to pick a session for recorder_export(session=<id> or 'last')."
+))
+def recorder_sessions() -> dict[str, Any]:
+    driver = require_driver()
+    events = driver.get_rec_events()
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for ev in events:
+        groups.setdefault(str(ev.get("session") or "(未分段)"), []).append(ev)
+    out = []
+    for sid, evs in sorted(groups.items(), key=lambda kv: min((float(e.get("ts") or 0) for e in kv[1]), default=0)):
+        types: dict[str, int] = {}
+        for e in evs:
+            types[e.get("type", "?")] = types.get(e.get("type", "?"), 0) + 1
+        entry = {
+            "session_id": sid,
+            "browser_id": evs[0].get("browser_id"),
+            "events": len(evs),
+            "types": types,
+            "start": time.strftime("%H:%M:%S", time.localtime(min(float(e.get("ts") or 0) for e in evs) / 1000)),
+            "end": time.strftime("%H:%M:%S", time.localtime(max(float(e.get("ts") or 0) for e in evs) / 1000)),
+            # 直接查磁盘（自动落盘发生在持有 WS 的进程，_REC_EXPORTED 跨进程不可见）
+            "exported_files": (
+                {"markdown": str(_REC_STORE_DIR / f"{sid}.md"), "jsonl": str(_REC_STORE_DIR / f"{sid}.jsonl")}
+                if (_REC_STORE_DIR / f"{sid}.md").exists() else None
+            ),
+        }
+        out.append(entry)
+    return {"status": "ok", "sessions": out, "server_buffered": len(events)}
+
+
+@mcp.tool(description=(
+    "Export a recorded session to markdown + events.jsonl under ./recordings/. "
+    "session: 'last' (the most recent session), a session id from recorder_sessions, "
+    "or '' (all buffered events). The session's events stay buffered unless clear=True "
+    "(which clears everything, not just the session)."
+))
+def recorder_export(
+    session: str = "last",
+    path: str = "",
+    clear: bool = False,
+) -> dict[str, Any]:
+    driver = require_driver()
+    all_events = list(driver.get_rec_events(clear=False))
+    if not all_events:
+        return {
+            "status": "empty",
+            "note": "No recorded events on the server. If a browser was recording while the "
+                    "server restarted, use recorder_status and re-export after the extension "
+                    "re-pushes, or stop the recording first (stop triggers a full push).",
+        }
+    sel = str(session or "").strip()
+    if sel and sel != "all":
+        groups: dict[str, list[float]] = {}
+        for ev in all_events:
+            groups.setdefault(str(ev.get("session") or "(未分段)"), []).append(float(ev.get("ts") or 0))
+        if sel == "last":
+            sel = max(groups, key=lambda sid: max(groups[sid]))
+        events = [e for e in all_events if str(e.get("session") or "(未分段)") == sel]
+        if not events:
+            return {"status": "empty", "note": f"No events for session {sel!r}", "available": list(groups)}
+        session_id = sel
+    else:
+        events = all_events
+        session_id = "all"
+    base = Path(path).expanduser().resolve() if path else (_REC_STORE_DIR / (session_id if session_id != "all" else f"rec_{time.strftime('%Y%m%d_%H%M%S')}"))
+    info = _write_rec_export(events, base)
+    _REC_EXPORTED[session_id] = {**info, "status": "ok", "session_id": session_id}
+    if clear:
+        driver.get_rec_events(clear=True)
+    md = (Path(info["markdown"])).read_text(encoding="utf-8")
+    return {
+        "status": "ok",
+        "session_id": session_id,
+        **info,
+        "preview": md[:1500],
+    }
 
 
 @mcp.tool(description="Execute arbitrary JS in the current page context or send JSON CDP bridge commands through the page bridge.")

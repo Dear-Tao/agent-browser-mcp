@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Agent Browser Bridge",
-  "version": "1.2.0",
+  "version": "1.3.5",
   "description": "桥接 agent-browser MCP 与真实 Chrome。点工具栏图标打开弹窗（顶部可设桥接地址）；或在 chrome://extensions 本扩展详情中打开「扩展程序选项」。",
   "permissions": [
     "cookies",
@@ -13,7 +13,8 @@
     "declarativeNetRequest",
     "management",
     "storage",
-    "downloads"
+    "downloads",
+    "webRequest"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -30,6 +31,12 @@
     {
       "matches": ["<all_urls>"],
       "js": ["config.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["recorder_capture.js"],
       "run_at": "document_idle",
       "all_frames": true
     }

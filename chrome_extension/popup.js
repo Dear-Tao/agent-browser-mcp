@@ -66,8 +66,11 @@ document.addEventListener('DOMContentLoaded', () => {
     identId.addEventListener('click', async () => {
       const id = identId.dataset.id || '';
       if (!id) return;
+      // 带上下文复制：Agent 拿到即知道是哪个浏览器
+      const label = (browserLabelEl && browserLabelEl.value.trim()) || '';
+      const text = label ? `${label}（${id}）` : id;
       try {
-        await navigator.clipboard.writeText(id);
+        await navigator.clipboard.writeText(text);
         if (identIdHint) identIdHint.textContent = '已复制';
         identId.classList.add('copied');
         setTimeout(() => {
@@ -240,6 +243,87 @@ document.addEventListener('DOMContentLoaded', () => {
   void loadBridgeUi();
   const connTimer = setInterval(() => void refreshConnStatus(), 2000);
   window.addEventListener('beforeunload', () => clearInterval(connTimer));
+
+  // --- 操作录制面板（平铺展示，打开即刷新状态）---
+  const recToggle = document.getElementById('recToggle');
+  const recHint = document.getElementById('recHint');
+  const recStatusText = document.getElementById('recStatusText');
+  const recSessionId = document.getElementById('recSessionId');
+  const recSessionIdText = document.getElementById('recSessionIdText');
+  const recSessionIdHint = document.getElementById('recSessionIdHint');
+  let recLastStatus = null; // 最近一次状态响应（复制时组装上下文用）
+
+  function recSetHint(text, kind) {
+    if (!recHint) return;
+    recHint.textContent = text || '';
+    recHint.className = 'hint' + (kind ? ' ' + kind : '');
+  }
+
+  function recRender(r) {
+    const on = !!r.recording;
+    if (recToggle) recToggle.textContent = on ? '停止录制' : '开始录制';
+    if (recStatusText) {
+      recStatusText.textContent = on
+        ? `● 录制中，已捕获 ${r.events || 0} 条`
+        : (r.events ? `未录制（上次捕获 ${r.events} 条）` : '未开启');
+    }
+    if (recSessionIdText) recSessionIdText.textContent = r.session_id || '—';
+    return on;
+  }
+
+  async function recRefresh() {
+    try {
+      const r = await chrome.runtime.sendMessage({ cmd: 'recorder', method: 'status' });
+      if (!r?.ok) {
+        recSetHint('状态失败: ' + (r?.error || 'unknown'), 'bad');
+        return false;
+      }
+      recLastStatus = r;
+      return recRender(r);
+    } catch (e) {
+      recSetHint('错误: ' + e.message, 'bad');
+      return false;
+    }
+  }
+
+  if (recToggle) {
+    recToggle.addEventListener('click', async () => {
+      recSetHint('');
+      const on = recToggle.textContent.includes('停止');
+      try {
+        const r = await chrome.runtime.sendMessage({ cmd: 'recorder', method: on ? 'stop' : 'start' });
+        if (!r?.ok) {
+          recSetHint('失败: ' + (r?.error || 'unknown'), 'bad');
+          return;
+        }
+        await recRefresh();
+        recSetHint(on ? `已停止，共 ${r.events || 0} 条事件` : `已开始录制「${r.browser_label || ''}」`, 'ok');
+      } catch (e) {
+        recSetHint('错误: ' + e.message, 'bad');
+      }
+    });
+  }
+  if (recSessionId) {
+    recSessionId.addEventListener('click', async () => {
+      const id = recSessionIdText ? recSessionIdText.textContent : '';
+      if (!id || id === '—') {
+        if (recSessionIdHint) recSessionIdHint.textContent = '暂无';
+        setTimeout(() => { if (recSessionIdHint) recSessionIdHint.textContent = '复制'; }, 1200);
+        return;
+      }
+      // 带上下文复制：Agent 拿到即可定位「哪个浏览器 + 哪次录制」
+      const st = recLastStatus || {};
+      const text = `${st.browser_label || '未知浏览器'}（${st.browser_id || '未知ID'}）操作录制会话ID：${id}`;
+      try {
+        await navigator.clipboard.writeText(text);
+        if (recSessionIdHint) recSessionIdHint.textContent = '已复制';
+        setTimeout(() => { if (recSessionIdHint) recSessionIdHint.textContent = '复制'; }, 1200);
+      } catch (e) {
+        if (recSessionIdHint) recSessionIdHint.textContent = '失败';
+      }
+    });
+  }
+  void recRefresh();
 });
 
 let lastCookieClipboard = '';

@@ -73,6 +73,11 @@ class TMWebDriver:
         self.latest_session_id = None
         # execute_js 超时后放弃的 exec_id：晚到的结果直接丢弃，防止 results 无限增长
         self._late_results = set()
+        # 操作录制事件流（rid 去重后顺序追加，上限 5000 条）
+        self.rec_events = []
+        self._rec_seen = set()
+        # 会话结束回调（server.py 注入，用于自动落盘该次会话）
+        self.on_rec_stopped = None
         self.is_remote = socket.socket().connect_ex(('127.0.0.1', port + 1)) == 0
         if not self.is_remote:  
             self.start_ws_server()  
@@ -125,9 +130,16 @@ class TMWebDriver:
         def link():
             data = request.json
             if data.get('cmd') == 'get_all_sessions': return json.dumps({'r': self.get_all_sessions()}, ensure_ascii=False)  
-            if data.get('cmd') == 'find_session': 
+            if data.get('cmd') == 'find_session':
                 url_pattern = data.get('url_pattern', '')
                 return json.dumps({'r': self.find_session(url_pattern)}, ensure_ascii=False)
+            if data.get('cmd') == 'rec_dump':
+                return json.dumps({'r': self.rec_events}, ensure_ascii=False)
+            if data.get('cmd') == 'rec_clear':
+                cleared = list(self.rec_events)
+                self.rec_events = []
+                self._rec_seen = set()
+                return json.dumps({'r': cleared}, ensure_ascii=False)
             if data.get('cmd') == 'execute_js':
                 session_id = data.get('sessionId')
                 code = data.get('code')
@@ -244,6 +256,33 @@ class TMWebDriver:
                                     'connected_at': time.time(),
                                 }
                                 driver._register_client(session_id, self, session_info)
+                    elif data.get('type') == 'rec_events':
+                        # 操作录制事件：按 rid 去重后追加（扩展分片推送会重叠）
+                        rec_events = data.get('events') or []
+                        rec_browser = (data.get('browser') or {}).get('id') or ''
+                        for ev in rec_events:
+                            if not isinstance(ev, dict):
+                                continue
+                            rid = ev.get('rid')
+                            key = (rec_browser, rid)
+                            if rid is not None and key in driver._rec_seen:
+                                continue
+                            if rid is not None:
+                                driver._rec_seen.add(key)
+                            ev.setdefault('browser_id', rec_browser)
+                            driver.rec_events.append(ev)
+                        if len(driver.rec_events) > 20000:
+                            overflow = len(driver.rec_events) - 20000
+                            del driver.rec_events[:overflow]
+                    elif data.get('type') == 'rec_stopped':
+                        # 某次录制会话结束：通知 server 层自动落盘该会话
+                        sess_id = data.get('session_id')
+                        bid = (data.get('browser') or {}).get('id') or ''
+                        if driver.on_rec_stopped:
+                            try:
+                                driver.on_rec_stopped(sess_id, bid)
+                            except Exception as exc:
+                                _safe_print(f"rec_stopped auto-export failed: {exc}")
                     elif data.get('type') == 'ack': driver.acks[data.get('id','')] = True
                     elif data.get('type') == 'result':
                         _id = data.get('id')
@@ -363,6 +402,17 @@ class TMWebDriver:
         if newtabs: rr['newTabs'] = newtabs
         return rr
     
+    def get_rec_events(self, clear: bool = False) -> list:
+        """录制事件流（remote 模式下端口属主持有缓冲，经 /link 透传）。"""
+        if self.is_remote:
+            cmd = {"cmd": "rec_clear" if clear else "rec_dump"}
+            return self._remote_cmd(cmd).get('r', [])
+        events = list(self.rec_events)
+        if clear:
+            self.rec_events = []
+            self._rec_seen = set()
+        return events
+
     def _remote_cmd(self, cmd):
         return requests.post(self.remote, headers={"Content-Type": "application/json"}, json=cmd).json()
 
